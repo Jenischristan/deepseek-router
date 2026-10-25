@@ -1,0 +1,250 @@
+import fs from 'node:fs';
+import { CONFIG_FILE, normalizeAccounts } from './config.js';
+
+const RELOAD_INTERVAL_MS = 5000;
+
+function accountsFromConfig(cfg) {
+  const accounts = normalizeAccounts(cfg.accounts);
+  if (accounts.length) return accounts;
+  return normalizeAccounts([
+    { token: cfg.token, cookies: cfg.cookies, hifLeim: cfg.hifLeim },
+  ]);
+}
+
+function normalizeSwitchAfter(value) {
+  const count = Number(value);
+  if (!Number.isFinite(count) || count <= 0) return 0;
+  return Math.floor(count);
+}
+
+export class TokenStore {
+  constructor(cfg) {
+    this.accounts = accountsFromConfig(cfg);
+    this.index = 0;
+    this.switchAfter = normalizeSwitchAfter(cfg.accountSwitchAfter);
+    this.messagesOnAccount = 0;
+    this.tokenFile = cfg.tokenFile || '';
+    // `null` disables disk reloads, which tests use to stay hermetic. The
+    // default keeps watching the user's config file.
+    this.configFile = 'configFile' in cfg ? cfg.configFile : CONFIG_FILE;
+    this._lastCheck = 0;
+    this._fileMtime = 0;
+    this._configMtime = 0;
+    this._envAccounts = Boolean(process.env.DEEPSEEK_ACCOUNTS);
+    this._envToken = Boolean(process.env.DEEPSEEK_TOKEN);
+    this._envCookies = Boolean(process.env.DEEPSEEK_COOKIES);
+    this._envHif = Boolean(process.env.DEEPSEEK_HIF_LEIM);
+    this._envSwitchAfter = process.env.DEEPSEEK_ACCOUNT_SWITCH_AFTER != null;
+  }
+
+  _replaceAccounts(list) {
+    const currentToken = this.accounts[this.index]?.token;
+    this.accounts = list;
+    const index = currentToken
+      ? list.findIndex((account) => account.token === currentToken)
+      : -1;
+    this.index = index >= 0 ? index : 0;
+    this.messagesOnAccount = 0;
+  }
+
+  _readTokenFile() {
+    if (!this.tokenFile) return;
+    try {
+      const stat = fs.statSync(this.tokenFile);
+      if (stat.mtimeMs !== this._fileMtime) {
+        this._fileMtime = stat.mtimeMs;
+        const token = fs.readFileSync(this.tokenFile, 'utf8').trim();
+        if (token) {
+          this._replaceAccounts(
+            normalizeAccounts([
+              { ...(this.accounts[0] || { cookies: '', hifLeim: '' }), token },
+              ...this.accounts.slice(1),
+            ]),
+          );
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  _readConfig() {
+    if (!this.configFile) return;
+    try {
+      const stat = fs.statSync(this.configFile);
+      if (stat.mtimeMs === this._configMtime) return;
+      this._configMtime = stat.mtimeMs;
+      const cfg = JSON.parse(fs.readFileSync(this.configFile, 'utf8'));
+
+      if (!this._envSwitchAfter && cfg.accountSwitchAfter !== undefined) {
+        this.switchAfter = normalizeSwitchAfter(cfg.accountSwitchAfter);
+        if (this.messagesOnAccount >= this.switchAfter) {
+          this.messagesOnAccount = 0;
+        }
+      }
+
+      if (this._envAccounts) return;
+
+      const accounts = normalizeAccounts(cfg.accounts);
+      if (accounts.length) {
+        if (this._envToken) {
+          const envAccount = this.accounts[0] || { token: '', cookies: '', hifLeim: '' };
+          this._replaceAccounts(
+            normalizeAccounts([
+              {
+                token: process.env.DEEPSEEK_TOKEN,
+                cookies: envAccount.cookies,
+                hifLeim: envAccount.hifLeim,
+              },
+              ...accounts,
+            ]),
+          );
+        } else {
+          this._replaceAccounts(accounts);
+        }
+        return;
+      }
+
+      const current = this.accounts[0] || { token: '', cookies: '', hifLeim: '' };
+      const primary = {
+        token:
+          !this._envToken && typeof cfg.token === 'string' && cfg.token
+            ? cfg.token
+            : current.token,
+        cookies:
+          !this._envCookies && typeof cfg.cookies === 'string'
+            ? cfg.cookies
+            : current.cookies,
+        hifLeim:
+          !this._envHif && typeof cfg.hifLeim === 'string'
+            ? cfg.hifLeim
+            : current.hifLeim,
+      };
+
+      if (primary.token) {
+        this._replaceAccounts([primary]);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  _maybeReload() {
+    const now = Date.now();
+    if (now - this._lastCheck < RELOAD_INTERVAL_MS) return;
+    this._lastCheck = now;
+    this._readTokenFile();
+    this._readConfig();
+  }
+
+  current() {
+    this._maybeReload();
+    return this.accounts[this.index] || null;
+  }
+
+  async get() {
+    return this.current()?.token || '';
+  }
+
+  get cookies() {
+    return this.current()?.cookies || '';
+  }
+
+  get hifLeim() {
+    return this.current()?.hifLeim || '';
+  }
+
+  get count() {
+    this._maybeReload();
+    return this.accounts.length;
+  }
+
+  get active() {
+    this._maybeReload();
+    return this.index;
+  }
+
+  rotate(failedToken = null) {
+    this._maybeReload();
+    if (this.accounts.length <= 1) return this.accounts[this.index] || null;
+
+    const current = this.accounts[this.index];
+    if (failedToken && current && current.token !== failedToken) {
+      return current;
+    }
+
+    this.index = (this.index + 1) % this.accounts.length;
+    this.messagesOnAccount = 0;
+    return this.accounts[this.index];
+  }
+
+  noteResponse(token = null) {
+    this._maybeReload();
+    if (this.switchAfter <= 0 || this.accounts.length <= 1) return null;
+
+    const current = this.accounts[this.index];
+    if (!current || (token && current.token !== token)) return null;
+
+    this.messagesOnAccount += 1;
+    if (this.messagesOnAccount < this.switchAfter) return null;
+
+    const from = this.index + 1;
+    this.messagesOnAccount = 0;
+    this.index = (this.index + 1) % this.accounts.length;
+    return { from, to: this.index + 1, count: this.switchAfter };
+  }
+
+  update(patch = {}) {
+    if (Array.isArray(patch.accounts) && patch.accounts.length) {
+      this._replaceAccounts(normalizeAccounts(patch.accounts));
+    } else if (typeof patch.token === 'string' && patch.token) {
+      const current = this.accounts[this.index] || { token: '', cookies: '', hifLeim: '' };
+      const updated = {
+        ...current,
+        token: patch.token,
+        cookies: typeof patch.cookies === 'string' ? patch.cookies : current.cookies,
+        hifLeim: typeof patch.hifLeim === 'string' ? patch.hifLeim : current.hifLeim,
+      };
+      const rest = this.accounts.filter((_, i) => i !== this.index);
+      const list = normalizeAccounts([updated, ...rest]);
+      const index = list.findIndex((account) => account.token === updated.token);
+      this.accounts = list;
+      this.index = index >= 0 ? index : 0;
+      this.messagesOnAccount = 0;
+    } else {
+      if (typeof patch.cookies === 'string' && this.accounts[this.index]) {
+        this.accounts[this.index] = { ...this.accounts[this.index], cookies: patch.cookies };
+      }
+      if (typeof patch.hifLeim === 'string' && this.accounts[this.index]) {
+        this.accounts[this.index] = { ...this.accounts[this.index], hifLeim: patch.hifLeim };
+      }
+    }
+
+    // Keep an in-memory update from being reverted by the periodic config
+    // reload. A later change to the file (new mtime) still wins.
+    if (this.configFile) {
+      try {
+        this._configMtime = fs.statSync(this.configFile).mtimeMs;
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  status() {
+    this._lastCheck = Date.now();
+    this._readTokenFile();
+    this._readConfig();
+    const current = this.accounts[this.index] || null;
+    return {
+      hasToken: Boolean(current?.token),
+      hasCookies: Boolean(current?.cookies),
+      hasHifLeim: Boolean(current?.hifLeim),
+      tokenLength: current?.token.length || 0,
+      accounts: this.accounts.length,
+      activeAccount: this.accounts.length ? this.index + 1 : 0,
+      switchAfter: this.switchAfter,
+      messagesOnAccount: this.messagesOnAccount,
+    };
+  }
+}

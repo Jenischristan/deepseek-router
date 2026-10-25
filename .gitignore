@@ -1,0 +1,7 @@
+config.json
+node_modules/
+*.log
+.DS_Store
+__pycache__/
+*.pyc
+/deepseek-router

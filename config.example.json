@@ -1,0 +1,22 @@
+{
+  "accounts": [],
+  "token": "",
+  "cookies": "",
+  "hifLeim": "",
+  "apiKey": "",
+  "host": "127.0.0.1",
+  "port": 8788,
+  "minIntervalMs": 400,
+  "concurrency": 1,
+  "sessionTtlMs": 21600000,
+  "maxSessions": 500,
+  "injectToolPrompt": true,
+  "parseToolCalls": true,
+  "repairToolCalls": true,
+  "maxToolRepairs": 2,
+  "accountSwitchAfter": 0,
+  "requestTimeoutMs": 600000,
+  "clientVersion": "2.7.0",
+  "locale": "en_US",
+  "logLevel": "info"
+}

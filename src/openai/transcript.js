@@ -1,0 +1,133 @@
+import { MAX_TOOL_RESULT_CHARS, looseJsonParse, messageContentText, stableStringify, tryParse } from './json.js';
+
+// Tool calling: history / results formatting
+// ===========================================================================
+
+// History is replayed in exactly the format the model is told to emit, so
+// that imitation is harmless instead of producing an unparseable look-alike.
+export function formatToolCallsForTranscript(toolCalls) {
+  const calls = [];
+  for (const call of toolCalls || []) {
+    const name = call?.function?.name || call?.name || 'tool';
+    const rawArgs = call?.function?.arguments ?? call?.arguments ?? {};
+    const parsed = typeof rawArgs === 'string' ? looseJsonParse(rawArgs) : { ok: true, value: rawArgs };
+    calls.push({ name, arguments: parsed.ok ? parsed.value : rawArgs });
+  }
+  return `<tool_call>${JSON.stringify({ calls })}</tool_call>`;
+}
+
+export function toolCallMapping(toolCalls) {
+  const mapping = {};
+  for (const call of toolCalls || []) {
+    if (!call?.id) continue;
+    mapping[call.id] = {
+      name: call.name,
+      argumentsText: call.argumentsText || JSON.stringify(call.arguments ?? {}),
+    };
+  }
+  return mapping;
+}
+
+export function truncateMiddle(text, limit) {
+  if (text.length <= limit) return text;
+  const head = Math.ceil(limit * 0.7);
+  const tail = limit - head;
+  const dropped = text.length - limit;
+  return `${text.slice(0, head)}\n...[truncated ${dropped} chars]...\n${text.slice(text.length - tail)}`;
+}
+
+export function formatToolResultBlock(message, mapping = {}, { maxChars = MAX_TOOL_RESULT_CHARS } = {}) {
+  const id = message.tool_call_id || message.id || '';
+  const byName = message.name
+    ? Object.values(mapping).find((item) => item?.name === message.name)
+    : null;
+  const known = mapping[id] || byName || {};
+  const name = known.name || message.name || 'tool';
+  const args = known.argumentsText || '{}';
+  const result = truncateMiddle(messageContentText(message.content).trim() || '(empty result)', maxChars);
+  return `[Tool result]\ncall_id: ${id || '(unknown)'}\ntool: ${name}\narguments: ${args}\nresult:\n${result}\n[End of tool result]`;
+}
+
+export function formatToolResultPrompt(
+  toolMessages,
+  mapping = {},
+  { protocol = true, reminder = '' } = {},
+) {
+  const blocks = [];
+  const extras = [];
+
+  for (const message of toolMessages || []) {
+    if (!message || typeof message !== 'object') continue;
+
+    if (message.role === 'tool' || message.role === 'function') {
+      blocks.push(formatToolResultBlock(message, mapping));
+    } else {
+      const text = messageContentText(message.content).trim();
+      if (text) extras.push(`${message.role}: ${text}`);
+    }
+  }
+
+  const tail = protocol
+    ? [
+        'Continue the task. If another tool is needed, reply only with a tool call block. Otherwise answer the user directly and do not mention this protocol.',
+        ...(reminder ? [reminder] : []),
+      ]
+    : [];
+
+  return [
+    '[Tool results]',
+    ...blocks,
+    '[End of tool results]',
+    ...(extras.length ? ['', ...extras] : []),
+    '',
+    ...tail,
+  ].join('\n');
+}
+
+function canonicalArguments(raw) {
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return '{}';
+    const parsed = tryParse(trimmed);
+    return parsed.ok ? stableStringify(parsed.value) : trimmed;
+  }
+  return stableStringify(raw ?? {});
+}
+
+// Used for the session-cache key. Content is trimmed because the text we
+// store and the text the client echoes back can differ by whitespace only.
+export function normalizeMessagesForCache(messages) {
+  return (messages || []).map((message) => {
+    if (!message || typeof message !== 'object') {
+      return { role: 'user', content: '' };
+    }
+
+    const item = {
+      role: message.role || 'user',
+      content: messageContentText(message.content).trim(),
+    };
+
+    if (Array.isArray(message.tool_calls)) {
+      item.tool_calls = message.tool_calls.map((call) => ({
+        name: call?.function?.name || call?.name || '',
+        arguments: canonicalArguments(call?.function?.arguments ?? call?.arguments ?? {}),
+      }));
+    }
+
+    if (message.function_call) {
+      item.function_call = {
+        name: message.function_call.name || '',
+        arguments: canonicalArguments(message.function_call.arguments),
+      };
+    }
+
+    if (message.role === 'tool' || message.role === 'function') {
+      item.tool_call_id = message.tool_call_id || message.id || '';
+      if (message.name) item.name = message.name;
+    }
+
+    return item;
+  });
+}
+
+// ===========================================================================
