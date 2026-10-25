@@ -19,6 +19,7 @@ function printUsage(out = process.stdout) {
       '  deepseek-router stop             stop the background server',
       '  deepseek-router status           show pid/log paths and state',
       '  deepseek-router logs [-n N]      print the last N log lines',
+      '  deepseek-router dashboard        open the FTXUI dashboard',
       '',
       'Options:',
       '  -f, --foreground                 stay attached to the terminal',
@@ -68,6 +69,34 @@ if (command === 'logs') {
   const text = tailLog(Number.isFinite(count) ? count : 50);
   process.stdout.write(text ? `${text.replace(/\n?$/, '\n')}` : `no log file at ${LOG_FILE}\n`);
   process.exit(0);
+}
+
+if (command === 'dashboard') {
+  const { spawnSync } = await import('node:child_process');
+  const { ROOT } = await import('./config.js');
+  const path = await import('node:path');
+  const fs = await import('node:fs');
+
+  const binary = path.join(ROOT, 'tui', 'deepseek-router-tui');
+  if (!fs.existsSync(binary)) {
+    process.stderr.write(
+      `dashboard binary not built: ${binary}\n` +
+        'build it with: make tui   (needs system FTXUI, see tui/Makefile)\n',
+    );
+    process.exit(1);
+  }
+
+  const config = loadConfig();
+  const tuiArgs = [binary, '--port', String(config.port)];
+  const interval = valueFor('-i', '--interval');
+  const lines = valueFor('-n', '--lines');
+  const url = valueFor('-u', '--url');
+  if (url) tuiArgs.push('--url', String(url));
+  if (interval) tuiArgs.push('--interval', String(interval));
+  if (lines) tuiArgs.push('--lines', String(lines));
+
+  const result = spawnSync(tuiArgs[0], tuiArgs.slice(1), { stdio: 'inherit' });
+  process.exit(result.status ?? 0);
 }
 
 if (command && command !== 'start') {

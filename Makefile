@@ -14,6 +14,12 @@ BINDIR ?= $(PREFIX)/bin
 
 all: deepseek-router
 
+tui:
+	$(MAKE) -C tui
+
+install-tui: tui
+	$(MAKE) -C tui install
+
 deepseek-router: deepseek-router.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
@@ -27,5 +33,6 @@ uninstall:
 
 clean:
 	rm -f deepseek-router
+	-$(MAKE) -C tui clean
 
-.PHONY: all install uninstall clean
+.PHONY: all install uninstall clean tui install-tui

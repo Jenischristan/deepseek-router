@@ -111,6 +111,23 @@ pulls all three from each browser profile/container automatically.
    `deepseek-router start --foreground`, `deepseek-router stop`,
    `deepseek-router status`, `deepseek-router logs -n 200`.
 
+   ### TUI dashboard
+
+   An optional C++ dashboard built with [FTXUI](https://github.com/ArthurSonzogni/FTXUI)
+   shows accounts, runtime state and the live log in a single pane:
+
+   ```bash
+   make tui                      # build tui/deepseek-router-tui (needs system FTXUI)
+   make install-tui              # install it into ~/.local/bin
+
+   deepseek-router dashboard     # or: npm run dashboard
+   deepseek-router dashboard --port 9000 --interval 1 --lines 200
+   ```
+
+   Keys: `r` refresh, `+`/`-` change the poll interval, `c` clear the log view,
+   `q` quit. It reads `/health` plus the pid/log files, so no extra endpoint is
+   needed; point it elsewhere with `--url http://host:port`.
+
 3. Point any OpenAI client at it:
 
    ```text
@@ -144,6 +161,7 @@ deepseek-router token:accounts      # --write-accounts
 deepseek-router token:watch         # --watch
 deepseek-router test                # node --test
 deepseek-router paths               # resolved paths and tools
+deepseek-router dashboard           # open the FTXUI dashboard
 ```
 
 `make install` symlinks the binary in this repository, so rebuilding updates

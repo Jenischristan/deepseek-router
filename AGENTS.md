@@ -9,6 +9,8 @@ npm test              # node --test (all tests)
 node --test test/tools.test.js   # one file
 make                  # build the optional C launcher
 make install          # symlink ./deepseek-router into ~/.local/bin
+make tui              # build tui/deepseek-router-tui (system FTXUI)
+make install-tui      # install the TUI into ~/.local/bin
 node --check src/main.js         # syntax check (repeat per file)
 python3 -m py_compile scripts/get-token.py
 ```
@@ -42,6 +44,7 @@ single quotes, trailing commas, ESM imports.
 | `src/openai/transcript.js` | Tool-call history and tool-result formatting, cache key normalization |
 | `src/openai/filter.js` | `ToolCallStreamFilter` and `splitAtToolMarker` |
 | `src/deepseek-router.c` | Optional launcher that `exec`s node/python |
+| `tui/dashboard.cpp` | FTXUI dashboard: polls `/health` via a forked node fetch, tails pid/log files |
 | `scripts/get-token.py` | Browser-profile token/cookie extractor |
 
 ### Dependency order (openai modules)

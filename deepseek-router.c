@@ -200,6 +200,7 @@ static void usage(FILE *out) {
     "  deepseek-router stop                 stop the background server\n"
     "  deepseek-router status               show pid/log state\n"
     "  deepseek-router logs [-n N]          print recent log lines\n"
+    "  deepseek-router dashboard            open the FTXUI dashboard\n"
     "  deepseek-router token [args...]      run the token helper (get-token.py)\n"
     "  deepseek-router token:write          save one browser session to the config\n"
     "  deepseek-router token:accounts       save every token-bearing account\n"
@@ -259,6 +260,22 @@ int main(int argc, char **argv) {
   if (strcmp(command, "start") == 0) return run_start(argc, argv, 2);
   if (strcmp(command, "stop") == 0 || strcmp(command, "status") == 0 || strcmp(command, "logs") == 0) {
     char *args[] = {"node", "src/main.js", (char *)command, NULL};
+    run(args);
+    return 1;
+  }
+  if (strcmp(command, "dashboard") == 0) {
+    size_t extra = (size_t)(argc > 2 ? argc - 2 : 0);
+    char **args = calloc(extra + 4, sizeof *args);
+    if (!args) {
+      perror("deepseek-router: calloc");
+      return 1;
+    }
+    size_t index = 0;
+    args[index++] = "node";
+    args[index++] = "src/main.js";
+    args[index++] = "dashboard";
+    for (int i = 2; i < argc; i++) args[index++] = argv[i];
+    args[index] = NULL;
     run(args);
     return 1;
   }

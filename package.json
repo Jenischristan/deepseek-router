@@ -18,7 +18,8 @@
     "foreground": "node src/main.js start --foreground",
     "stop": "node src/main.js stop",
     "status": "node src/main.js status",
-    "logs": "node src/main.js logs"
+    "logs": "node src/main.js logs",
+    "dashboard": "node src/main.js dashboard"
   },
   "engines": {
     "node": ">=20.3.0"
