@@ -92,10 +92,24 @@ pulls all three from each browser profile/container automatically.
 
    ```bash
    npm start
-   # or: node src/index.js
+   # or: node src/main.js
    ```
 
-   It listens on `http://127.0.0.1:8788` by default.
+   It listens on `http://127.0.0.1:8788` by default. `start` runs in the
+   background and writes logs to `~/.config/deepseek-router/router.log`; a pid
+   file in the same directory lets the CLI stop it again.
+
+   ```bash
+   npm start                             # background (headless, default)
+   npm run foreground                    # attached, live logs in this terminal
+   npm run status                        # state, pid, log path
+   npm run logs                          # last 50 log lines
+   npm run stop                          # stop the background server
+   ```
+
+   The same flags work on the compiled launcher: `deepseek-router`,
+   `deepseek-router start --foreground`, `deepseek-router stop`,
+   `deepseek-router status`, `deepseek-router logs -n 200`.
 
 3. Point any OpenAI client at it:
 
@@ -109,7 +123,8 @@ pulls all three from each browser profile/container automatically.
 
 A small C launcher provides one `deepseek-router` command for the Node and
 Python entry points. It resolves the repository and `exec`s the real script;
-router behavior stays in `src/index.js`.
+router behavior stays in `src/index.js`, while `src/main.js` handles the
+background/foreground CLI.
 
 ```bash
 make                 # build ./deepseek-router
@@ -118,8 +133,12 @@ deepseek-router --help
 ```
 
 ```bash
-deepseek-router                     # start the server
+deepseek-router                     # start in the background
 deepseek-router start --port 9000   # override port/host
+deepseek-router start --foreground  # attached, with live logs
+deepseek-router logs -n 100         # recent background log lines
+deepseek-router status              # running? which pid?
+deepseek-router stop                # stop the background server
 deepseek-router token --write       # python3 scripts/get-token.py --write
 deepseek-router token:accounts      # --write-accounts
 deepseek-router token:watch         # --watch

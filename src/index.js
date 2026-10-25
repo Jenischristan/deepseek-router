@@ -8,36 +8,38 @@ import { PowSolver } from './pow.js';
 import { createServer } from './server.js';
 import { TokenStore } from './token.js';
 
-const config = loadConfig();
+export async function runForeground() {
+  const config = loadConfig();
 
-if (!fs.existsSync(config.wasmPath)) {
-  console.error(`Missing PoW solver wasm: ${config.wasmPath}`);
-  console.error('Copy the DeepSeek sha3 wasm to assets/sha3.wasm or set SHA3_WASM.');
-  process.exit(1);
-}
-
-let solver;
-try {
-  solver = new PowSolver(config.wasmPath);
-} catch (error) {
-  console.error(`Failed to initialize PoW solver: ${error.message}`);
-  process.exit(1);
-}
-
-const tokenStore = new TokenStore(config);
-const client = new DeepSeekClient({ tokenStore, solver, config });
-const server = createServer({ config, tokenStore, client });
-
-server.on('error', (error) => {
-  if (error.code === 'EADDRINUSE') {
-    console.error(`Port ${config.port} is already in use. Set PORT to another value.`);
-  } else {
-    console.error(`Server error: ${error.message}`);
+  if (!fs.existsSync(config.wasmPath)) {
+    console.error(`Missing PoW solver wasm: ${config.wasmPath}`);
+    console.error('Copy the DeepSeek sha3 wasm to assets/sha3.wasm or set SHA3_WASM.');
+    process.exit(1);
   }
-  process.exit(1);
-});
 
-server.listen(config.port, config.host, () => {
+  let solver;
+  try {
+    solver = new PowSolver(config.wasmPath);
+  } catch (error) {
+    console.error(`Failed to initialize PoW solver: ${error.message}`);
+    process.exit(1);
+  }
+
+  const tokenStore = new TokenStore(config);
+  const client = new DeepSeekClient({ tokenStore, solver, config });
+  const server = createServer({ config, tokenStore, client });
+
+  server.on('error', (error) => {
+    if (error.code === 'EADDRINUSE') {
+      console.error(`Port ${config.port} is already in use. Set PORT to another value.`);
+    } else {
+      console.error(`Server error: ${error.message}`);
+    }
+    process.exit(1);
+  });
+
+  await new Promise((resolve) => server.listen(config.port, config.host, resolve));
+
   const url = `http://${config.host}:${config.port}`;
   const status = tokenStore.status();
   console.log(`deepseek-router listening on ${url}`);
@@ -51,16 +53,22 @@ server.listen(config.port, config.host, () => {
   console.log(`  auth:   ${config.apiKey ? 'enabled (API key required)' : 'disabled'}`);
   console.log(`  models: ${MODELS.map((model) => model.id).join(', ')}`);
   console.log(`  upstream: serialized, min interval ${config.minIntervalMs}ms`);
-});
 
-let closing = false;
-function shutdown(signal) {
-  if (closing) return;
-  closing = true;
-  console.log(`\nReceived ${signal}, shutting down...`);
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 2000).unref();
+  let closing = false;
+  function shutdown(signal) {
+    if (closing) return;
+    closing = true;
+    console.log(`\nReceived ${signal}, shutting down...`);
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 2000).unref();
+  }
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  return server;
 }
 
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(new URL(import.meta.url).pathname)) {
+  await runForeground();
+}

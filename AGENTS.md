@@ -9,7 +9,7 @@ npm test              # node --test (all tests)
 node --test test/tools.test.js   # one file
 make                  # build the optional C launcher
 make install          # symlink ./deepseek-router into ~/.local/bin
-node --check src/server.js       # syntax check (repeat per file)
+node --check src/main.js         # syntax check (repeat per file)
 python3 -m py_compile scripts/get-token.py
 ```
 
@@ -20,7 +20,9 @@ single quotes, trailing commas, ESM imports.
 
 | File | Role |
 | --- | --- |
+| `src/main.js` | CLI: background start (default), `--foreground`, `stop`, `status`, `logs` |
 | `src/index.js` | Entry point: load config, init PoW solver, start server, signals |
+| `src/daemon.js` | pid/log file handling for the background server |
 | `src/config.js` | `loadConfig` (env > file), `saveConfig`, `normalizeAccounts` |
 | `src/token.js` | `TokenStore`: account queue, rotation, config/token-file hot reload |
 | `src/deepseek.js` | Upstream client: sessions, PoW header, completion, retries |
@@ -55,6 +57,8 @@ Import from the lowest module that declares the symbol; avoid cycles (only
 - Streaming and non-streaming both go through `completionOutcome` for finish reason/usage — keep them in sync.
 - Tool protocol must never leak raw markup into assistant `content`; see `tools.test.js`.
 - Tests must not touch `~/.config/deepseek-router/config.json` or the network.
+- The pid/log files live in `~/.config/deepseek-router/`; `DEEPSEEK_ROUTER_FOREGROUND=1`
+  is set by the detached child so the same code path serves both modes.
 - Config keys added to code must also be added to `README.md` and `config.example.json`.
 
 ## Testing

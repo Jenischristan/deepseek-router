@@ -22,7 +22,7 @@ static int is_file(const char *path) {
 static int is_install_root(const char *dir) {
   char path[PATH_MAX];
   if (!dir || !*dir) return 0;
-  if (snprintf(path, sizeof path, "%s/src/index.js", dir) >= (int)sizeof path) return 0;
+  if (snprintf(path, sizeof path, "%s/src/main.js", dir) >= (int)sizeof path) return 0;
   if (!is_file(path)) return 0;
   if (snprintf(path, sizeof path, "%s/scripts/get-token.py", dir) >= (int)sizeof path) return 0;
   return is_file(path);
@@ -115,6 +115,18 @@ static int run_python(const char *flag, int argc, char **argv, int start) {
 }
 
 static int run_start(int argc, char **argv, int start) {
+  size_t extra = (size_t)(argc > start ? argc - start : 0);
+  char **args = calloc(extra + 3, sizeof *args);
+  if (!args) {
+    perror("deepseek-router: calloc");
+    return 1;
+  }
+
+  size_t index = 0;
+  args[index++] = "node";
+  args[index++] = "src/main.js";
+  args[index++] = "start";
+
   for (int i = start; i < argc; i++) {
     if (strcmp(argv[i], "--port") == 0 || strcmp(argv[i], "-p") == 0) {
       if (++i >= argc) {
@@ -132,13 +144,16 @@ static int run_start(int argc, char **argv, int start) {
       setenv("INJECT_TOOL_PROMPT", "0", 1);
     } else if (strcmp(argv[i], "--no-tool-parse") == 0) {
       setenv("PARSE_TOOL_CALLS", "0", 1);
+    } else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--foreground") == 0) {
+      args[index++] = (char *)"--foreground";
     } else {
       fprintf(stderr, "deepseek-router: unknown start option '%s'\n", argv[i]);
+      free(args);
       return 2;
     }
   }
 
-  char *args[] = {"node", "src/index.js", NULL};
+  args[index] = NULL;
   run(args);
   return 1;
 }
@@ -164,7 +179,7 @@ static void print_paths(const char *root) {
   char found[PATH_MAX];
   printf("launcher: %s\n", ROUTER_VERSION);
   printf("root:     %s\n", root);
-  printf("server:   %s/src/index.js\n", root);
+  printf("server:   %s/src/main.js\n", root);
   printf("token:    %s/scripts/get-token.py\n", root);
   printf("node:     %s\n", find_program("node", found, sizeof found) ? found : "(not found)");
   printf("python3:  %s\n", find_program("python3", found, sizeof found) ? found : "(not found)");
@@ -180,7 +195,11 @@ static void usage(FILE *out) {
     "deepseek-router %s - compiled launcher for the local DeepSeek router\n"
     "\n"
     "Usage:\n"
-    "  deepseek-router [start] [options]    start the OpenAI-compatible server\n"
+    "  deepseek-router [start] [options]    start in the background (headless)\n"
+    "  deepseek-router start --foreground   run attached with live logs\n"
+    "  deepseek-router stop                 stop the background server\n"
+    "  deepseek-router status               show pid/log state\n"
+    "  deepseek-router logs [-n N]          print recent log lines\n"
     "  deepseek-router token [args...]      run the token helper (get-token.py)\n"
     "  deepseek-router token:write          save one browser session to the config\n"
     "  deepseek-router token:accounts       save every token-bearing account\n"
@@ -195,6 +214,7 @@ static void usage(FILE *out) {
     "  -H, --host HOST                      listen host (default 127.0.0.1)\n"
     "      --no-tool-prompt                 disable DSML prompt injection\n"
     "      --no-tool-parse                  disable DSML tool-call parsing\n"
+    "  -f, --foreground                     stay attached to the terminal\n"
     "\n"
     "Token examples:\n"
     "  deepseek-router token --list\n"
@@ -237,6 +257,11 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (strcmp(command, "start") == 0) return run_start(argc, argv, 2);
+  if (strcmp(command, "stop") == 0 || strcmp(command, "status") == 0 || strcmp(command, "logs") == 0) {
+    char *args[] = {"node", "src/main.js", (char *)command, NULL};
+    run(args);
+    return 1;
+  }
   if (command[0] == '-') return run_start(argc, argv, 1);
   if (strcmp(command, "token") == 0 || strcmp(command, "get-token") == 0) return run_python(NULL, argc, argv, 2);
   if (strcmp(command, "token:write") == 0) return run_python("--write", argc, argv, 2);

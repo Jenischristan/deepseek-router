@@ -4,17 +4,21 @@
   "private": true,
   "description": "OpenAI-compatible router for chat.deepseek.com using a local Zen/Firefox session",
   "type": "module",
-  "main": "src/index.js",
+  "main": "src/main.js",
   "bin": {
-    "deepseek-router": "src/index.js"
+    "deepseek-router": "src/main.js"
   },
   "scripts": {
-    "start": "node src/index.js",
+    "start": "node src/main.js",
     "test": "node --test",
     "token": "python3 scripts/get-token.py",
     "token:write": "python3 scripts/get-token.py --write",
     "token:accounts": "python3 scripts/get-token.py --write-accounts",
-    "token:watch": "python3 scripts/get-token.py --watch"
+    "token:watch": "python3 scripts/get-token.py --watch",
+    "foreground": "node src/main.js start --foreground",
+    "stop": "node src/main.js stop",
+    "status": "node src/main.js status",
+    "logs": "node src/main.js logs"
   },
   "engines": {
     "node": ">=20.3.0"
