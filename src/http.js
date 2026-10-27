@@ -1,12 +1,13 @@
 // HTTP server
 // ===========================================================================
 
+import crypto from 'node:crypto';
 import http from 'node:http';
 
 import { saveConfig } from './config.js';
 import { AuthError, HttpError, UpstreamError } from './errors.js';
 import { SessionStore, conversationKey } from './sessions.js';
-import { MODELS, buildSeedPrompt, chunk, completionResponse, contentToText, estimateTokens, makeId, openaiError, resolveModel, usageChunk } from './openai/models.js';
+import { MODELS, buildSeedPrompt, chunk, completionResponse, contentToText, dataUrlToBuffer, estimateTokens, extractImages, makeId, openaiError, resolveModel, usageChunk } from './openai/models.js';
 import { consumeDeepSeekStream, fragmentsText } from './openai/sse.js';
 import { makeToolCallId, normalizeToolChoice, normalizeTools, toolChoiceMode, toolSignature } from './openai/json.js';
 import { buildToolInstructions, formatToolReminder } from './openai/prompt.js';
@@ -374,6 +375,20 @@ function unusableCallNotice(interp) {
   return `[deepseek-router] The model tried to call a tool but the call was unusable: ${reasons}`;
 }
 
+// Turns inline image parts into DeepSeek file ids. Images are uploaded once
+// per request (keyed by content hash) so the same picture reused across turns
+// does not consume upload quota repeatedly.
+function imageUploadKey(image) {
+  if (image.kind !== 'data') return `url:${image.url}`;
+  return crypto.createHash('sha256').update(image.data).digest('hex');
+}
+
+function imageToFile(image) {
+  const buffer = dataUrlToBuffer(image);
+  if (!buffer) return null;
+  return new File([buffer], image.filename, { type: image.mime || 'image/png' });
+}
+
 export function createServer({ config, tokenStore, client }) {
   const log = createLogger(config.logLevel);
   const sessions = new SessionStore({
@@ -456,7 +471,8 @@ export function createServer({ config, tokenStore, client }) {
 
     if (lastMessage.role === 'user') {
       const text = contentToText(lastMessage.content).trim();
-      if (text) turn = { prefix: messages.slice(0, -1), prompt: text };
+      const images = extractImages(lastMessage.content);
+      if (text || images.length) turn = { prefix: messages.slice(0, -1), prompt: text, images };
     } else if (lastMessage.role === 'tool' || lastMessage.role === 'function') {
       let assistantIndex = -1;
       for (let i = messages.length - 2; i >= 0; i -= 1) {
@@ -513,6 +529,39 @@ export function createServer({ config, tokenStore, client }) {
         );
 
       const triedAccounts = new Set();
+      const uploadedFiles = new Map();
+
+      const uploadImages = async (images, account) => {
+        const ids = [];
+        for (const image of images || []) {
+          if (image.kind === 'url') {
+            throw new HttpError(400, 'Remote image URLs are not supported; send a base64 data URL', {
+              param: 'messages',
+            });
+          }
+          const key = imageUploadKey(image);
+          let id = uploadedFiles.get(key);
+          if (!id) {
+            const file = imageToFile(image);
+            if (!file) {
+              throw new HttpError(400, 'Image attachment has no data', { param: 'messages' });
+            }
+            await gate.pace(controller.signal);
+            const info = await client.uploadFile({
+              file,
+              thinking,
+              modelType: image.modelType || model.modelType,
+              signal: controller.signal,
+              account,
+            });
+            id = info.id;
+            uploadedFiles.set(key, id);
+            log.debug(`uploaded image ${image.filename} -> ${id}`);
+          }
+          ids.push(id);
+        }
+        return ids;
+      };
 
       for (let attempt = 0; ; attempt += 1) {
         const account = tokenStore.current();
@@ -528,6 +577,7 @@ export function createServer({ config, tokenStore, client }) {
             ? sessions.get(keyFor(turn.prefix, account.token))
             : null;
           let continuationPrompt = turn?.prompt || '';
+          let refFileIds = [];
 
           if (cached && turn?.toolMessages) {
             const mapping = {
@@ -540,6 +590,10 @@ export function createServer({ config, tokenStore, client }) {
             });
           } else if (cached && continuationPrompt && toolReminder) {
             continuationPrompt = `${continuationPrompt}\n\n${toolReminder}`;
+          }
+
+          if (!cached && turn?.images?.length) {
+            refFileIds = await uploadImages(turn.images, account);
           }
 
           if (cached && continuationPrompt) {
@@ -574,6 +628,7 @@ export function createServer({ config, tokenStore, client }) {
             modelType: model.modelType,
             thinking,
             search,
+            refFileIds,
             signal: controller.signal,
             account,
           });

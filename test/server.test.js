@@ -63,10 +63,17 @@ function fakeTokenStore() {
 
 async function withServer(content, fn, overrides = {}) {
   const prompts = [];
+  const uploads = [];
+  const completions = [];
   const client = {
     createSession: async () => 'session-1',
-    completion: async ({ prompt }) => {
+    uploadFile: async ({ file }) => {
+      uploads.push(file);
+      return { id: `file-${uploads.length}`, is_image: true };
+    },
+    completion: async ({ prompt, refFileIds }) => {
       prompts.push(prompt);
+      completions.push({ prompt, refFileIds });
       return new Response(sseFor(content), {
         status: 200,
         headers: { 'content-type': 'text/event-stream' },
@@ -88,7 +95,7 @@ async function withServer(content, fn, overrides = {}) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address();
   try {
-    await fn(`http://127.0.0.1:${port}`, prompts);
+    await fn(`http://127.0.0.1:${port}`, prompts, { uploads, completions });
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
@@ -445,5 +452,123 @@ test('include_usage emits a final chunk with empty choices', async () => {
     assert.deepEqual(usage.choices, []);
     assert.equal(typeof usage.usage.total_tokens, 'number');
     assert.match(text, /data: \[DONE\]/);
+  });
+});
+
+test('uploads inline image parts and sends them as ref_file_ids', async () => {
+  await withServer('a tiny pixel', async (base, prompts, { uploads, completions }) => {
+    const pixel = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'what is this?' },
+              { type: 'image_url', image_url: { url: `data:image/png;base64,${pixel}` } },
+            ],
+          },
+        ],
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(uploads.length, 1);
+    assert.equal(uploads[0].type, 'image/png');
+    assert.equal(completions[0].refFileIds.length, 1);
+    assert.equal(completions[0].refFileIds[0], 'file-1');
+    assert.match(prompts[0], /what is this\?/);
+    assert.doesNotMatch(prompts[0], /base64/);
+  });
+});
+
+test('accepts an image-only user message', async () => {
+  await withServer('ok', async (base, prompts) => {
+    const pixel = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [
+          {
+            role: 'user',
+            content: [{ type: 'image_url', image_url: { url: `data:image/png;base64,${pixel}` } }],
+          },
+        ],
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(prompts.length, 1);
+  });
+});
+
+test('uploads multiple images and keeps their order', async () => {
+  await withServer('two pictures', async (base, prompts, { uploads, completions }) => {
+    const red = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
+    const blue = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'compare these' },
+              { type: 'image_url', image_url: { url: `data:image/png;base64,${red}` } },
+              { type: 'image_url', image_url: { url: `data:image/png;base64,${blue}` } },
+            ],
+          },
+        ],
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(uploads.length, 2);
+    assert.deepEqual(completions[0].refFileIds, ['file-1', 'file-2']);
+  });
+});
+
+test('does not re-upload an image when the session is reused', async () => {
+  await withServer('seen it', async (base, prompts, { uploads, completions }) => {
+    const pixel = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
+    const messages = [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'what is this?' },
+          { type: 'image_url', image_url: { url: `data:image/png;base64,${pixel}` } },
+        ],
+      },
+    ];
+    const send = (body) =>
+      fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    const first = await send({ model: 'deepseek-chat', messages });
+    assert.equal(first.status, 200);
+    assert.equal(uploads.length, 1);
+    assert.deepEqual(completions[0].refFileIds, ['file-1']);
+
+    // The client echoes the assistant reply and asks a follow-up; the cached
+    // upstream session is reused, so no image upload and no ref_file_ids.
+    const second = await send({
+      model: 'deepseek-chat',
+      messages: [
+        ...messages,
+        { role: 'assistant', content: 'seen it' },
+        { role: 'user', content: 'and now?' },
+      ],
+    });
+    assert.equal(second.status, 200);
+    assert.equal(uploads.length, 1);
+    assert.equal(completions.length, 2);
+    assert.deepEqual(completions[1].refFileIds, []);
   });
 });

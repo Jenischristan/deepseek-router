@@ -424,7 +424,13 @@ python3 scripts/get-token.py --profile ~/.config/zen/<profile> --write
 
 ## Limitations
 
-- Text only. Images and file attachments are replaced with a short placeholder.
+- Images are supported for OpenAI-style `image_url` content parts with base64
+  `data:` URLs (for example `data:image/png;base64,...`) or `input_image`
+  parts. The router uploads each image to the active DeepSeek account and
+  passes the returned file ids as `ref_file_ids`; the model then sees the
+  picture, so no placeholder is left in the prompt. Remote `http(s)` image URLs
+  and plain file attachments are not fetched or uploaded and are replaced with
+  a short placeholder.
 - Tool calling is emulated through the prompt, not a native upstream API. It is
   best-effort: large tool sets or adversarial prompts can produce malformed
   calls. Missing DSML closing tags, repeated parameters, and stray parameters

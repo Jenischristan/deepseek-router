@@ -2,7 +2,7 @@
 // ===========================================================================
 
 import crypto from 'node:crypto';
-
+import { formatToolCallsForTranscript } from './transcript.js';
 const CREATED = 1704067200;
 
 export const MODELS = [
@@ -58,6 +58,77 @@ export function makeId(prefix = 'chatcmpl') {
   return `${prefix}-${crypto.randomBytes(12).toString('hex')}`;
 }
 
+const IMAGE_MIME = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  gif: 'image/gif',
+  bmp: 'image/bmp',
+  svg: 'image/svg+xml',
+  ico: 'image/x-icon',
+  tif: 'image/tiff',
+  tiff: 'image/tiff',
+  avif: 'image/avif',
+  apng: 'image/apng',
+};
+
+function imageUrlOf(part) {
+  if (!part) return null;
+  if (part.type === 'image_url') {
+    const url = part.image_url && typeof part.image_url === 'object'
+      ? part.image_url.url
+      : part.image_url;
+    return typeof url === 'string' ? url : null;
+  }
+  // OpenAI Responses / newer chat clients use { type: 'input_image', image_url }.
+  if (part.type === 'input_image') {
+    if (typeof part.image_url === 'string') return part.image_url;
+    if (typeof part.url === 'string') return part.url;
+    if (typeof part.data === 'string' && typeof part.mimeType === 'string') {
+      return `data:${part.mimeType};base64,${part.data}`;
+    }
+  }
+  return null;
+}
+
+// An image part becomes an ordered descriptor the HTTP layer can upload.
+// `data` holds a base64 data: URL payload (uploaded as-is); `url` is kept for
+// remote http(s) images but is not fetched here.
+export function extractImages(content) {
+  if (!Array.isArray(content)) return [];
+  const images = [];
+  for (const part of content) {
+    const url = imageUrlOf(part);
+    if (!url) continue;
+    const dataMatch = /^data:([^;,]+)?(?:;[^,]*)?;base64,(.*)$/is.exec(url);
+    if (dataMatch) {
+      const mime = (dataMatch[1] || 'image/png').toLowerCase();
+      const data = dataMatch[2].replace(/\s+/g, '');
+      const ext = Object.keys(IMAGE_MIME).find((key) => IMAGE_MIME[key] === mime) || 'png';
+      images.push({
+        kind: 'data',
+        mime,
+        data,
+        filename: part.image_url?.filename || `image-${images.length + 1}.${ext}`,
+      });
+    } else if (/^https?:\/\//i.test(url)) {
+      images.push({
+        kind: 'url',
+        url,
+        filename: part.image_url?.filename || `image-${images.length + 1}`,
+      });
+    }
+  }
+  return images;
+}
+
+export function dataUrlToBuffer(image) {
+  if (!image || image.kind !== 'data') return null;
+  const buffer = Buffer.from(image.data, 'base64');
+  return buffer.length ? buffer : null;
+}
+
 export function contentToText(content) {
   if (content == null) return '';
   if (typeof content === 'string') return content;
@@ -72,15 +143,11 @@ export function contentToText(content) {
       } else if (part && typeof part === 'object') {
         if (part.type === 'text' || part.type === 'input_text') {
           if (typeof part.text === 'string') parts.push(part.text);
-        } else if (part.type === 'image_url') {
-          const url =
-            part.image_url && typeof part.image_url === 'object'
-              ? part.image_url.url
-              : part.image_url;
-          // Never paste a base64 data: URL (can be megabytes) into the prompt.
-          const shown =
-            typeof url === 'string' && /^https?:\/\//i.test(url) && url.length <= 300 ? `: ${url}` : '';
-          parts.push(`[Image attachment omitted${shown}]`);
+        } else if (imageUrlOf(part)) {
+          const url = imageUrlOf(part);
+          const remote =
+            typeof url === 'string' && /^https?:\/\//i.test(url) && url.length <= 300;
+          parts.push(remote ? `[Image attachment: ${url}]` : '[Image attachment]');
         } else if (typeof part.text === 'string') {
           parts.push(part.text);
         }
