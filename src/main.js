@@ -137,8 +137,8 @@ if (foreground) {
       `started deepseek-router in the background (pid ${result.pid})`,
       `  url:      http://${config.host}:${config.port}`,
       `  logs:     ${LOG_FILE}`,
-      `  stop:     deepseek-router stop`,
-      `  attached: deepseek-router start --foreground`,
+      '  stop:     deepseek-router stop',
+      '  attached: deepseek-router start --foreground',
       '',
     ].join('\n'),
   );

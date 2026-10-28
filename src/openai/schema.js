@@ -12,7 +12,16 @@ export function normalizeIdentifier(value) {
 export function schemaTypes(schema) {
   if (!schema || typeof schema !== 'object') return [];
   const raw = Array.isArray(schema.type) ? schema.type : schema.type ? [schema.type] : [];
-  return raw.filter((item) => typeof item === 'string');
+  const types = raw.filter((item) => typeof item === 'string');
+  const variants = schema.anyOf || schema.oneOf;
+  if (Array.isArray(variants)) {
+    for (const variant of variants) {
+      for (const type of schemaTypes(variant)) {
+        if (!types.includes(type)) types.push(type);
+      }
+    }
+  }
+  return types;
 }
 
 export function primaryType(schema) {
@@ -22,22 +31,22 @@ export function primaryType(schema) {
 
 export function valueMatchesType(value, type) {
   switch (type) {
-    case 'string':
-      return typeof value === 'string';
-    case 'integer':
-      return typeof value === 'number' && Number.isInteger(value);
-    case 'number':
-      return typeof value === 'number' && Number.isFinite(value);
-    case 'boolean':
-      return typeof value === 'boolean';
-    case 'array':
-      return Array.isArray(value);
-    case 'object':
-      return isPlainObject(value);
-    case 'null':
-      return value === null;
-    default:
-      return true;
+  case 'string':
+    return typeof value === 'string';
+  case 'integer':
+    return typeof value === 'number' && Number.isInteger(value);
+  case 'number':
+    return typeof value === 'number' && Number.isFinite(value);
+  case 'boolean':
+    return typeof value === 'boolean';
+  case 'array':
+    return Array.isArray(value);
+  case 'object':
+    return isPlainObject(value);
+  case 'null':
+    return value === null;
+  default:
+    return true;
   }
 }
 
@@ -113,9 +122,20 @@ export function findProperty(key, properties, taken) {
   return null;
 }
 
+function keysRelated(left, right) {
+  const a = normalizeIdentifier(left);
+  const b = normalizeIdentifier(right);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.length >= 4 && b.length >= 4 && damerauDistance(a, b) <= 1) return true;
+  return PARAM_ALIAS_GROUPS.some((group) => group.includes(a) && group.includes(b));
+}
+
 // Maps the argument names a model used onto the names the schema declares.
 // `guess` enables the "one unknown argument + one missing parameter" repair; it
 // must be off when the alignment is only used to decide WHICH tool a call is for.
+// Guessing is limited to related key names: mapping an unrelated "code" onto
+// "command" would execute something the model never asked for.
 export function alignArguments(args, schema, { guess = true } = {}) {
   const input = isPlainObject(args) ? args : {};
   const properties = isPlainObject(schema?.properties) ? schema.properties : null;
@@ -162,6 +182,7 @@ export function alignArguments(args, schema, { guess = true } = {}) {
     guess &&
     leftover.length === 1 &&
     missing.length === 1 &&
+    keysRelated(leftover[0][0], missing[0]) &&
     matchesSchemaType(leftover[0][1], properties[missing[0]])
   ) {
     output[missing[0]] = leftover[0][1];
@@ -202,6 +223,16 @@ const TEXT_KEY_RE =
 
 export function coerceSchemaValue(value, schema, key = '') {
   if (value == null || !schema || typeof schema !== 'object') return value;
+  const variants = schema.anyOf || schema.oneOf;
+  if (Array.isArray(variants) && variants.length) {
+    const matching = variants.find((variant) => matchesSchemaType(value, variant));
+    if (matching) return coerceSchemaValue(value, matching, key);
+    for (const variant of variants) {
+      const coerced = coerceSchemaValue(value, variant, key);
+      if (matchesSchemaType(coerced, variant)) return coerced;
+    }
+    return value;
+  }
   const types = schemaTypes(schema);
   if (!types.length) return value;
   if (types.some((type) => valueMatchesType(value, type))) {
@@ -431,9 +462,9 @@ export function nameVariants(raw) {
   };
   const strip = (value) => {
     let text = String(value ?? '').trim();
-    text = text.replace(/^[`"'<\[({\s]+|[`"'>\])}\s]+$/g, '');
+    text = text.replace(/^[`"'<[({ \s]+|[`"'>\])}\s]+$/g, '');
     text = text.replace(/\(\s*\)$/, '');
-    return text.replace(/^[`"'<\[({\s]+|[`"'>\])}\s]+$/g, '').trim();
+    return text.replace(/^[`"'<[({ \s]+|[`"'>\])}\s]+$/g, '').trim();
   };
 
   const base = strip(raw);
@@ -470,17 +501,6 @@ export function damerauDistance(a, b) {
   return d[a.length][b.length];
 }
 
-export function argsFitTool(args, tool) {
-  if (!isPlainObject(args)) return true;
-  const schema = tool.parameters || {};
-  const properties = isPlainObject(schema.properties) ? schema.properties : {};
-  const aligned = alignArguments(args, schema, { guess: false });
-  if (aligned.missing.length) return false;
-  const keys = Object.keys(args);
-  if (!keys.length || !Object.keys(properties).length) return true;
-  return aligned.matched > 0;
-}
-
 export function rankToolNames(raw, tools, limit = 3) {
   const index = toIndex(tools);
   const wanted = normalizeIdentifier(nameVariants(raw).at(-1) || raw);
@@ -502,9 +522,12 @@ export function rankToolNames(raw, tools, limit = 3) {
 }
 
 // Resolves whatever name the model wrote to a real tool name.
-//   strict=true  -> only exact / cleaned / case-insensitive / normalised matches
-//   strict=false -> also suffix, synonym and typo matches, gated on `args`
-export function resolveToolName(raw, toolsOrIndex, { args, strict = false } = {}) {
+// Only exact, cleaned (namespace / wrapper stripping), case-insensitive and
+// normalised matches are accepted automatically. Synonyms, suffixes and typos
+// are only suggestions: renaming "web_search" to "search" (or "bsah" to "bash")
+// and executing it would run a tool the model never chose. Those go through a
+// repair round-trip instead.
+export function resolveToolName(raw, toolsOrIndex) {
   const index = toIndex(toolsOrIndex);
   const original = String(raw ?? '').trim();
   if (!index.tools.length) {
@@ -530,52 +553,6 @@ export function resolveToolName(raw, toolsOrIndex, { args, strict = false } = {}
     if (hits?.length === 1) return { name: hits[0].name, how: 'normalized', suggestions: [] };
   }
 
-  const miss = () => ({ name: null, how: null, suggestions: rankToolNames(original, index) });
-  if (strict) return miss();
-
-  const unique = (candidates) => (candidates.length === 1 ? candidates[0] : null);
-  const fits = (tool) => argsFitTool(args, tool);
-  const wanted = normalizeIdentifier(variants[0]);
-  if (!wanted) return miss();
-
-  // Namespace noise: "mcp__server__read_file" vs "read_file" (either direction).
-  const suffixHits = index.tools.filter((tool) => {
-    const normalized = normalizeIdentifier(tool.name);
-    if (normalized === wanted) return false;
-    const longEnough = Math.min(normalized.length, wanted.length) >= 4;
-    return (
-      longEnough && (wanted.endsWith(normalized) || normalized.endsWith(wanted)) && fits(tool)
-    );
-  });
-  const bySuffix = unique(suffixHits);
-  if (bySuffix) return { name: bySuffix.name, how: 'suffix', suggestions: [] };
-
-  // Same concept, different word: "execute_bash" -> "bash".
-  const groups = TOOL_SYNONYM_GROUPS.filter((items) => items.includes(wanted));
-  if (groups.length) {
-    const synonymHits = index.tools.filter(
-      (tool) =>
-        groups.some((items) => items.includes(normalizeIdentifier(tool.name))) && fits(tool),
-    );
-    const bySynonym = unique(synonymHits);
-    if (bySynonym) return { name: bySynonym.name, how: 'synonym', suggestions: [] };
-  }
-
-  // Typos: "raed_file" -> "read_file".
-  if (wanted.length >= 4) {
-    const threshold = Math.max(1, Math.floor(wanted.length * 0.25));
-    const scored = index.tools
-      .map((tool) => ({
-        tool,
-        distance: damerauDistance(wanted, normalizeIdentifier(tool.name)),
-      }))
-      .filter((item) => item.distance <= threshold && fits(item.tool))
-      .sort((a, b) => a.distance - b.distance);
-    if (scored.length && (scored.length === 1 || scored[1].distance > scored[0].distance)) {
-      return { name: scored[0].tool.name, how: 'fuzzy', suggestions: [] };
-    }
-  }
-
-  return miss();
+  return { name: null, how: null, suggestions: rankToolNames(original, index) };
 }
 // ===========================================================================

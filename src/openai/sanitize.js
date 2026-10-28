@@ -19,7 +19,8 @@ function unwrapArguments(value, schema) {
     }
     if (!isPlainObject(inner)) continue;
 
-    const { [key]: _wrapped, ...rest } = value;
+    const rest = { ...value };
+    delete rest[key];
     return { ...inner, ...rest };
   }
   return value;

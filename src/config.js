@@ -9,8 +9,16 @@ export const CONFIG_DIR = process.env.XDG_CONFIG_HOME
   : path.join(os.homedir(), '.config', 'deepseek-router');
 export const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 
+export function configFilePath() {
+  return process.env.DEEPSEEK_ROUTER_CONFIG_FILE || CONFIG_FILE;
+}
+
 export function readConfigFile() {
-  for (const file of [CONFIG_FILE, path.join(ROOT, 'config.json')]) {
+  const explicit = process.env.DEEPSEEK_ROUTER_CONFIG_FILE;
+  const candidates = explicit
+    ? [explicit]
+    : [CONFIG_FILE, path.join(ROOT, 'config.json')];
+  for (const file of candidates) {
     let text;
     try {
       text = fs.readFileSync(file, 'utf8');
@@ -41,10 +49,10 @@ export function normalizeAccounts(list) {
         ? { token: entry.trim(), cookies: '', hifLeim: '' }
         : entry && typeof entry === 'object'
           ? {
-              token: typeof entry.token === 'string' ? entry.token.trim() : '',
-              cookies: typeof entry.cookies === 'string' ? entry.cookies : '',
-              hifLeim: typeof entry.hifLeim === 'string' ? entry.hifLeim : '',
-            }
+            token: typeof entry.token === 'string' ? entry.token.trim() : '',
+            cookies: typeof entry.cookies === 'string' ? entry.cookies : '',
+            hifLeim: typeof entry.hifLeim === 'string' ? entry.hifLeim : '',
+          }
           : null;
 
     if (!account?.token || seen.has(account.token)) continue;
@@ -155,7 +163,8 @@ export function loadConfig() {
 }
 
 export function saveConfig(patch) {
-  fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  const target = configFilePath();
+  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
 
   // The token extractor may rewrite the same file while the router is running.
   // Re-read just before writing and retry if the file changed underneath us, so
@@ -164,24 +173,24 @@ export function saveConfig(patch) {
     let before = null;
     let current = {};
     try {
-      before = fs.statSync(CONFIG_FILE);
-      current = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+      before = fs.statSync(target);
+      current = JSON.parse(fs.readFileSync(target, 'utf8'));
     } catch {
       // Missing or unreadable file: start from an empty object.
     }
 
     const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
+    fs.writeFileSync(target, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
 
     let after = null;
     try {
-      after = fs.statSync(CONFIG_FILE);
+      after = fs.statSync(target);
     } catch {
       // ignore
     }
     if (!before || !after || after.mtimeMs !== before.mtimeMs || attempt === 2) {
       try {
-        fs.chmodSync(CONFIG_FILE, 0o600);
+        fs.chmodSync(target, 0o600);
       } catch {
         // ignore
       }

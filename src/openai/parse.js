@@ -1,7 +1,8 @@
-import { extractCalls, extractDsml, extractV3Tokens } from './extract.js';
-import { MAX_CALLS, WS, has, isPlainObject, looseJsonParse, parseLooseValues, scanJsonValue, stableStringify, toolChoiceMode, tryParse } from './json.js';
+import { PREFIXED_TAG_SRC, extractCalls, extractDsml, extractV3Tokens } from './extract.js';
+import { MAX_CALLS, WS, isPlainObject, looseJsonParse, parseLooseValues, scanJsonValue, stableStringify, toolChoiceMode, tryParse } from './json.js';
 import { sanitizeToolCalls, validateToolCalls } from './sanitize.js';
 import { resolveToolName, toIndex } from './schema.js';
+import { formatToolSignatures } from './prompt.js';
 
 // Tool calling: response parsing
 // ===========================================================================
@@ -13,9 +14,83 @@ export function stripLeadingThink(text) {
     if (!open) return source;
     const rest = source.slice(open[0].length);
     const close = /<\/think(?:ing)?\s*>/i.exec(rest);
-    if (!close) return '';
+    // An unclosed think block is a truncated reply, not a reason to discard
+    // everything the model produced. Drop the opening marker and keep the text.
+    if (!close) return rest;
     source = rest.slice(close.index + close[0].length);
   }
+}
+
+const TOOL_WRAPPER_RE = /<(tool_calls?|function_calls?|tool_uses?)\b[^>]*>/gi;
+
+// ```xml / ```json fence that opens immediately before a wrapper tag.
+function fenceBefore(text, start) {
+  const match = /```[A-Za-z0-9_+.-]*[ \t]*\r?\n[ \t]*$/.exec(
+    text.slice(Math.max(0, start - 96), start),
+  );
+  return match ? start - match[0].length : -1;
+}
+
+// Closing fence that follows a wrapper tag on its own line.
+function fenceAfter(text, start) {
+  const match = /^[ \t]*\r?\n[ \t]*```[ \t]*(?:\r?\n|$)/.exec(text.slice(start));
+  return match ? start + match[0].length : -1;
+}
+
+// A call body may be wrapped in a Markdown fence and/or preceded by a name line:
+//   <tool_call>```json\n{...}\n```</tool_call>
+//   <tool_call>bash\n{...}</tool_call>
+function cleanCallBody(body) {
+  let text = String(body || '').trim();
+  let hintName = null;
+
+  const fenced = /^```[A-Za-z0-9_+.-]*[ \t]*\r?\n([\s\S]*?)\r?\n?```[ \t]*$/i.exec(text);
+  if (fenced) {
+    text = fenced[1].trim();
+  } else {
+    const named = /^([A-Za-z_][\w.:-]*)[ \t]*\r?\n([\s\S]+)$/.exec(text);
+    if (named && /^(?:```|[{[])/.test(named[2].trim())) {
+      hintName = named[1];
+      text = named[2].trim();
+      const innerFence =
+        /^```[A-Za-z0-9_+.-]*[ \t]*\r?\n([\s\S]*?)\r?\n?```[ \t]*$/i.exec(text);
+      if (innerFence) text = innerFence[1].trim();
+    }
+  }
+
+  return { text, hintName };
+}
+
+// Reads the concatenated JSON payloads that start at `start`, skipping the
+// stray braces/commas a model leaves between them.
+function scanPayloads(text, start) {
+  const payloads = [];
+  let index = start;
+  for (;;) {
+    while (
+      index < text.length &&
+      (WS.has(text[index]) ||
+        text[index] === ',' ||
+        text[index] === '}' ||
+        text[index] === ']')
+    ) {
+      index += 1;
+    }
+    if (text[index] !== '{' && text[index] !== '[') break;
+    const stop = scanJsonValue(text, index);
+    if (stop === -1) return { payloads, unbalanced: true, end: index };
+    payloads.push(text.slice(index, stop));
+    index = stop;
+  }
+  return { payloads, unbalanced: false, end: index };
+}
+
+// Index just past the first closing tag at or after `from`.
+function findCloser(text, name, from) {
+  const re = new RegExp(String.raw`\s*</${name}\s*>`, 'gi');
+  re.lastIndex = from;
+  const match = re.exec(text);
+  return match ? { start: match.index, end: re.lastIndex } : null;
 }
 
 function looksLikeDsml(text) {
@@ -108,98 +183,122 @@ export function parseToolResponse(text, tools = [], options = {}) {
     return true;
   };
 
-  const handlePayloadText = (body) => {
+  const handlePayloadText = (body, hintName = null) => {
     const beforeCalls = calls.length;
     const beforeInvalid = invalidCalls.length;
+    const hint = (value) => {
+      if (!hintName || !isPlainObject(value)) return value;
+      if (value.name || value.function || value.calls || value.tool_calls || value.tool_uses) {
+        return value;
+      }
+      return { name: hintName, arguments: value };
+    };
+    const absorbOne = (value, repaired) => {
+      const before = calls.length;
+      absorb(hint(value));
+      if (repaired) {
+        for (let i = before; i < calls.length; i += 1) calls[i].repaired = true;
+      }
+    };
     const parsed = looseJsonParse(body);
     if (parsed.ok) {
-      absorb(parsed.value);
+      absorbOne(parsed.value, parsed.repaired);
     } else {
-      for (const value of parseLooseValues(body)) absorb(value);
+      for (const value of parseLooseValues(body)) absorbOne(value, false);
     }
     if (calls.length === beforeCalls && invalidCalls.length === beforeInvalid) {
       invalidCalls.push({ name: null, reason: parsed.ok ? 'missing_name' : 'invalid_json' });
     }
   };
 
-  // 1) <tool_call>{...}</tool_call>, found by balancing the JSON itself, so a
-  //    string value containing "</tool_call>" cannot cut the block short and a
-  //    missing closing tag is tolerated.
+  // 1) <tool_call>{...}</tool_call> (and the tool_calls/function_call/tool_use
+  //    spellings). A closing tag inside a JSON string must not end the block;
+  //    a closing tag after malformed JSON is used as the block boundary so the
+  //    whole body can be repaired instead of silently truncating it.
   const extractBlocks = (input) => {
-    const openRe = /<tool_call\b[^>]*>/gi;
-    const closeRe = /\s*<\/tool_call\s*>/iy;
+    const openRe = new RegExp(TOOL_WRAPPER_RE.source, 'gi');
     let out = '';
     let cursor = 0;
     let match;
 
     while ((match = openRe.exec(input)) !== null) {
-      const bodyStart = openRe.lastIndex;
-      out += input.slice(cursor, match.index);
+      const wrapper = match[1].toLowerCase();
+      const openEnd = openRe.lastIndex;
+      const fenceStart = fenceBefore(input, match.index);
+      const matchStart = fenceStart >= cursor ? fenceStart : match.index;
+      out += input.slice(cursor, matchStart);
 
-      let probe = bodyStart;
-      while (probe < input.length && WS.has(input[probe])) probe += 1;
+      const firstCloser = findCloser(input, wrapper, openEnd);
+      const bodyPreview = input.slice(openEnd, firstCloser ? firstCloser.start : input.length);
 
-      if (input[probe] === '{' || input[probe] === '[') {
-        const payloads = [];
-        let end = probe;
-        while (end < input.length && (input[end] === '{' || input[end] === '[')) {
-          const stop = scanJsonValue(input, end);
-          if (stop === -1) {
-            const rest = input.slice(end);
-            const closing = /<\/tool_call\s*>/i.exec(rest);
-            const body = closing ? rest.slice(0, closing.index) : rest;
-            payloads.push({ text: body, unbalanced: true });
-            end += body.length;
-            break;
-          }
-          payloads.push({ text: input.slice(end, stop), unbalanced: false });
-          end = stop;
-          while (end < input.length && WS.has(input[end])) end += 1;
-          // Stray closers/commas between payloads ("}},{"): skip them so the
-          // next balanced object is still recovered as its own call.
-          while (end < input.length && (input[end] === '}' || input[end] === ']' || input[end] === ',')) {
-            end += 1;
-            while (end < input.length && WS.has(input[end])) end += 1;
-          }
-        }
-
-        closeRe.lastIndex = end;
-        const closed = closeRe.exec(input);
-        if (closed) end = closeRe.lastIndex;
-
-        for (const payload of payloads) {
-          if (payload.unbalanced && !closed && context.truncated) {
-            invalidCalls.push({ name: null, reason: 'truncated_call' });
-          } else {
-            handlePayloadText(payload.text);
-          }
-        }
-        cursor = end;
-        openRe.lastIndex = Math.max(openRe.lastIndex, end);
+      if (looksLikeDsml(bodyPreview)) {
+        // Drop only the wrapper; the DSML pass owns the body.
+        out += bodyPreview;
+        cursor = firstCloser ? firstCloser.end : input.length;
+        openRe.lastIndex = cursor;
         continue;
       }
 
-      const rest = input.slice(bodyStart);
-      const closing = /<\/tool_call\s*>/i.exec(rest);
-      const body = closing ? rest.slice(0, closing.index) : rest;
-      if (looksLikeDsml(body)) {
-        cursor = bodyStart; // drop only the wrapper tag; DSML pass handles the rest
+      const scanned = scanPayloads(input, openEnd);
+      let closer = null;
+      if (scanned.payloads.length && !scanned.unbalanced) {
+        closer = findCloser(input, wrapper, scanned.end);
+      } else {
+        closer = firstCloser;
+      }
+
+      if (scanned.payloads.length && !scanned.unbalanced) {
+        const between = closer ? input.slice(scanned.end, closer.start) : '';
+        const cleanBetween = between.replace(/[\s,}\]]/g, '') === '';
+        if (cleanBetween) {
+          for (const payload of scanned.payloads) handlePayloadText(payload);
+          let end = closer ? closer.end : scanned.end;
+          if (fenceStart !== -1 && closer) {
+            const fenceEnd = fenceAfter(input, end);
+            if (fenceEnd !== -1) end = fenceEnd;
+          }
+          cursor = end;
+          openRe.lastIndex = Math.max(openRe.lastIndex, end);
+          continue;
+        }
+      }
+
+      const rawBody = input.slice(openEnd, closer ? closer.start : input.length);
+      const cleaned = cleanCallBody(rawBody);
+      const trimmedBody = cleaned.text.trim();
+      const hasCloser = Boolean(closer);
+
+      if (!trimmedBody) {
+        cursor = closer ? closer.end : input.length;
+        openRe.lastIndex = Math.max(openRe.lastIndex, cursor);
         continue;
       }
-      const trimmedBody = body.trim();
+
       // "<tool_call>" merely mentioned in prose: no JSON follows and the tag is
       // never closed (or what it wraps is clearly not an attempted call).
       const proseMention =
-        Boolean(trimmedBody) &&
-        ((!closing && !context.truncated) ||
-          (trimmedBody.length < 80 && !/[{["=:<]/.test(trimmedBody)));
+        !hasCloser &&
+        !context.truncated &&
+        trimmedBody.length < 80 &&
+        !/[{["=:<`]/.test(trimmedBody);
       if (proseMention) {
-        cursor = match.index; // keep the text as-is
+        cursor = matchStart;
         continue;
       }
-      if (trimmedBody) invalidCalls.push({ name: null, reason: 'invalid_json' });
-      cursor = bodyStart + body.length + (closing ? closing[0].length : 0);
-      openRe.lastIndex = cursor;
+
+      if (scanned.unbalanced && !hasCloser && context.truncated) {
+        invalidCalls.push({ name: null, reason: 'truncated_call' });
+      } else {
+        handlePayloadText(cleaned.text, cleaned.hintName);
+      }
+
+      let end = closer ? closer.end : input.length;
+      if (fenceStart !== -1 && closer) {
+        const fenceEnd = fenceAfter(input, end);
+        if (fenceEnd !== -1) end = fenceEnd;
+      }
+      cursor = end;
+      openRe.lastIndex = Math.max(openRe.lastIndex, end);
     }
 
     return out + input.slice(cursor);
@@ -220,25 +319,7 @@ export function parseToolResponse(text, tools = [], options = {}) {
   for (const call of v3.calls) addCall(call);
   invalidCalls.push(...v3.invalid);
 
-  // 3) The model imitating the transcript label it saw in history.
-  if (!calls.length && !invalidCalls.length) {
-    const label = /\[Assistant tool calls\]\s*/i.exec(content);
-    if (label) {
-      const start = content.indexOf('{', label.index + label[0].length);
-      const bracket = content.indexOf('[', label.index + label[0].length);
-      const from = [start, bracket].filter((value) => value !== -1).sort((a, b) => a - b)[0];
-      if (from !== undefined) {
-        const stop = scanJsonValue(content, from);
-        const body = stop === -1 ? content.slice(from) : content.slice(from, stop);
-        const parsed = looseJsonParse(body);
-        if (parsed.ok && absorb(parsed.value, { ...context, allowInference: false })) {
-          content = content.slice(0, label.index) + (stop === -1 ? '' : content.slice(stop));
-        }
-      }
-    }
-  }
-
-  // 4) ```json fenced call, 5) whole reply is a JSON call.
+  // 3) ```json fenced call, 4) whole reply is a JSON call.
   if (!calls.length && !invalidCalls.length && restricted) {
     const fenceRe = /```(?:json|tool_call|tool)?[ \t]*\r?\n?([\s\S]*?)```/gi;
     content = content.replace(fenceRe, (match, body) => {
@@ -256,7 +337,7 @@ export function parseToolResponse(text, tools = [], options = {}) {
     }
   }
 
-  content = content.replace(/```(?:json)?\s*```/gi, '').trim();
+  content = content.replace(/```[A-Za-z0-9_+.-]*[ \t]*\r?\n?[ \t]*```/gi, '').trim();
   return { calls, content, invalidCalls };
 }
 
@@ -315,29 +396,29 @@ export function interpretToolResponse(text, tools, options = {}) {
 export function describeInvalidCall(item) {
   const quoted = item.name ? `"${item.name}"` : 'a tool call';
   switch (item.reason) {
-    case 'unknown_tool': {
-      const hint = item.suggestions?.length
-        ? ` Did you mean ${item.suggestions.map((name) => `"${name}"`).join(' or ')}?`
-        : ' Use only the tool names listed.';
-      return `${quoted} is not an available tool.${hint}`;
-    }
-    case 'invalid_json':
-      return 'a <tool_call> block did not contain valid JSON (escape newlines as \\n and quotes as \\" inside strings).';
-    case 'invalid_arguments':
-      return `the arguments for ${quoted} were not a valid JSON object.`;
-    case 'missing_name':
-      return 'a tool call had no tool name.';
-    case 'unterminated_parameter':
-    case 'unterminated_invoke':
-    case 'truncated_call':
-      return (
-        `the tool call${item.name ? ` for "${item.name}"` : ''} was cut off before it was complete. ` +
+  case 'unknown_tool': {
+    const hint = item.suggestions?.length
+      ? ` Did you mean ${item.suggestions.map((name) => `"${name}"`).join(' or ')}?`
+      : ' Use only the tool names listed.';
+    return `${quoted} is not an available tool.${hint}`;
+  }
+  case 'invalid_json':
+    return 'a <tool_call> block did not contain valid JSON (escape newlines as \\n and quotes as \\" inside strings).';
+  case 'invalid_arguments':
+    return `the arguments for ${quoted} were not a valid JSON object.`;
+  case 'missing_name':
+    return 'a tool call had no tool name.';
+  case 'unterminated_parameter':
+  case 'unterminated_invoke':
+  case 'truncated_call':
+    return (
+      `the tool call${item.name ? ` for "${item.name}"` : ''} was cut off before it was complete. ` +
         'Send a shorter call (for large file contents, write them in smaller pieces).'
-      );
-    case 'too_many_calls':
-      return 'too many tool calls in one block.';
-    default:
-      return `${quoted} was invalid (${item.reason}).`;
+    );
+  case 'too_many_calls':
+    return 'too many tool calls in one block.';
+  default:
+    return `${quoted} was invalid (${item.reason}).`;
   }
 }
 
@@ -382,8 +463,13 @@ export function buildToolRepairPrompt(interpretation, tools, { toolChoice = 'aut
   const everything = tools.length <= 30;
   lines.push(
     '',
-    'Reply again with ONLY the corrected tool block. Include ALL the tool calls you intended, not just the failed ones, in exactly this format:',
-    '<tool_call>{"calls":[{"name":"<exact tool name>","arguments":{...}}]}</tool_call>',
+    'Reply again with ONLY the corrected tool block. Include ALL the tool calls you intended, not just the failed ones, in DeepSeek DSML markup:',
+    '<\uFF5CDSML\uFF5Ccalls>',
+    '<\uFF5CDSML\uFF5Cinvoke name="<exact tool name>">',
+    '<\uFF5CDSML\uFF5Cparameter name="<exact parameter name>" string="true">value</\uFF5CDSML\uFF5Cparameter>',
+    '</\uFF5CDSML\uFF5Cinvoke>',
+    '</\uFF5CDSML\uFF5Ccalls>',
+    'Use string="false" for non-string values (JSON value). The JSON form <tool_call>{"calls":[...]}</tool_call> is also accepted as a fallback.',
     'Tool names and parameter names are case-sensitive.',
   );
   if (focus.length || everything) {

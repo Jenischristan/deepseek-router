@@ -35,7 +35,11 @@ function sseFor(content) {
         message_id: 'msg-1',
         status: 'FINISHED',
         accumulated_token_usage: 42,
-        fragments: parts.map((part) => ({ type: 'RESPONSE', content: part })),
+        fragments: parts.map((part) =>
+          typeof part === 'string'
+            ? { type: 'RESPONSE', content: part }
+            : { type: part.type || 'RESPONSE', content: part.content || '' },
+        ),
       },
     },
   };
@@ -74,7 +78,9 @@ async function withServer(content, fn, overrides = {}) {
     completion: async ({ prompt, refFileIds }) => {
       prompts.push(prompt);
       completions.push({ prompt, refFileIds });
-      return new Response(sseFor(content), {
+      const turn = prompts.length - 1;
+      const reply = typeof content === 'function' ? content(turn, prompt) : content;
+      return new Response(sseFor(reply), {
         status: 200,
         headers: { 'content-type': 'text/event-stream' },
       });
@@ -570,5 +576,135 @@ test('does not re-upload an image when the session is reused', async () => {
     assert.equal(uploads.length, 1);
     assert.equal(completions.length, 2);
     assert.deepEqual(completions[1].refFileIds, []);
+  });
+});
+
+test('executes a tool call written inside the reasoning fragment', async () => {
+  const reply = [
+    { type: 'THINK', content: 'I should inspect the directory.\n' },
+    { type: 'THINK', content: dsmlCall('ls') },
+  ];
+  await withServer(reply, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(request(false)),
+    });
+    assert.equal(res.status, 200);
+    const json = await res.json();
+    const message = json.choices[0].message;
+    assert.equal(json.choices[0].finish_reason, 'tool_calls');
+    assert.equal(message.content, null);
+    assert.equal(message.tool_calls[0].function.name, 'bash');
+    assert.deepEqual(JSON.parse(message.tool_calls[0].function.arguments), { command: 'ls' });
+    assert.equal(message.reasoning_content, 'I should inspect the directory.');
+    assert.doesNotMatch(message.reasoning_content, /DSML|invoke|parameter/);
+  });
+});
+
+test('streaming reasoning never leaks tool markup and still executes the call', async () => {
+  const reply = [
+    { type: 'THINK', content: 'I should inspect the directory.\n' },
+    { type: 'THINK', content: dsmlCall('ls') },
+  ];
+  await withServer(reply, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(request(true)),
+    });
+    assert.equal(res.status, 200);
+    const events = parseSse(await res.text());
+    let content = '';
+    let reasoning = '';
+    const calls = [];
+    for (const event of events) {
+      const delta = event.choices?.[0]?.delta || {};
+      if (typeof delta.content === 'string') content += delta.content;
+      if (typeof delta.reasoning_content === 'string') reasoning += delta.reasoning_content;
+      for (const piece of delta.tool_calls || []) {
+        calls[piece.index] = calls[piece.index] || { name: '', arguments: '' };
+        if (piece.function?.name) calls[piece.index].name = piece.function.name;
+        if (piece.function?.arguments) calls[piece.index].arguments += piece.function.arguments;
+      }
+    }
+    assert.equal(content, '');
+    assert.match(reasoning, /I should inspect the directory/);
+    assert.doesNotMatch(reasoning, /DSML|invoke|parameter/);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].name, 'bash');
+    assert.deepEqual(JSON.parse(calls[0].arguments), { command: 'ls' });
+  });
+});
+
+test('asks for one repair and executes only the corrected call', async () => {
+  const unknown = '<tool_call>{"name":"bsah","arguments":{"command":"ls"}}</tool_call>';
+  await withServer(
+    (turn) => (turn === 0 ? unknown : dsmlCall('ls')),
+    async (base, prompts) => {
+      const res = await fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(request(false)),
+      });
+      assert.equal(res.status, 200);
+      const json = await res.json();
+      assert.equal(prompts.length, 2);
+      assert.match(prompts[1], /\[Tool call error\]/);
+      assert.match(prompts[1], /Did you mean "bash"\?/);
+      assert.match(prompts[1], /DSML/);
+      assert.equal(json.choices[0].finish_reason, 'tool_calls');
+      assert.deepEqual(JSON.parse(json.choices[0].message.tool_calls[0].function.arguments), {
+        command: 'ls',
+      });
+    },
+  );
+});
+
+test('never executes tool markup found in a SEARCH fragment', async () => {
+  const reply = [
+    { type: 'SEARCH', content: dsmlCall('ls') },
+    { type: 'RESPONSE', content: 'No tool was needed.' },
+  ];
+  await withServer(reply, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(request(false)),
+    });
+    assert.equal(res.status, 200);
+    const json = await res.json();
+    assert.equal(json.choices[0].finish_reason, 'stop');
+    assert.equal(json.choices[0].message.tool_calls, undefined);
+    assert.equal(json.choices[0].message.content, 'No tool was needed.');
+    assert.doesNotMatch(json.choices[0].message.reasoning_content || '', /DSML|invoke|parameter/);
+  });
+});
+
+test('streaming SEARCH markup is held back and not executed', async () => {
+  const reply = [
+    { type: 'SEARCH', content: dsmlCall('ls') },
+    { type: 'RESPONSE', content: 'No tool was needed.' },
+  ];
+  await withServer(reply, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(request(true)),
+    });
+    assert.equal(res.status, 200);
+    const events = parseSse(await res.text());
+    let content = '';
+    let reasoning = '';
+    let calls = 0;
+    for (const event of events) {
+      const delta = event.choices?.[0]?.delta || {};
+      if (typeof delta.content === 'string') content += delta.content;
+      if (typeof delta.reasoning_content === 'string') reasoning += delta.reasoning_content;
+      calls += delta.tool_calls?.length || 0;
+    }
+    assert.equal(content, 'No tool was needed.');
+    assert.equal(calls, 0);
+    assert.doesNotMatch(reasoning, /DSML|invoke|parameter/);
   });
 });

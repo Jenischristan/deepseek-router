@@ -317,8 +317,8 @@ export class DeepSeekClient {
 
     throw lastError instanceof Error
       ? new UpstreamError(`DeepSeek request failed: ${lastError.message}`, {
-          retryable: true,
-        })
+        retryable: true,
+      })
       : new UpstreamError('DeepSeek request failed');
   }
 }

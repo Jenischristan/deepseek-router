@@ -3,6 +3,22 @@ import { MAX_TOOL_RESULT_CHARS, looseJsonParse, messageContentText, stableString
 // Tool calling: history / results formatting
 // ===========================================================================
 
+const DSML_BAR = '\uFF5C';
+
+function transcriptValue(value) {
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  // A literal closing tag would terminate the parameter early. Fall back to a
+  // JSON-encoded value (still accepted by the parser) when that can happen.
+  if (
+    typeof value === 'string' &&
+    !text.includes(`</${DSML_BAR}DSML${DSML_BAR}parameter>`) &&
+    !text.includes(`<${DSML_BAR}DSML${DSML_BAR}`)
+  ) {
+    return { value: text, attribute: 'true' };
+  }
+  return { value: JSON.stringify(value).replace(/</g, '\\u003c'), attribute: 'false' };
+}
+
 // History is replayed in exactly the format the model is told to emit, so
 // that imitation is harmless instead of producing an unparseable look-alike.
 export function formatToolCallsForTranscript(toolCalls) {
@@ -10,19 +26,41 @@ export function formatToolCallsForTranscript(toolCalls) {
   for (const call of toolCalls || []) {
     const name = call?.function?.name || call?.name || 'tool';
     const rawArgs = call?.function?.arguments ?? call?.arguments ?? {};
-    const parsed = typeof rawArgs === 'string' ? looseJsonParse(rawArgs) : { ok: true, value: rawArgs };
+    const parsed =
+      typeof rawArgs === 'string' ? looseJsonParse(rawArgs) : { ok: true, value: rawArgs };
     calls.push({ name, arguments: parsed.ok ? parsed.value : rawArgs });
   }
-  return `<tool_call>${JSON.stringify({ calls })}</tool_call>`;
+
+  if (!calls.length) return '';
+
+  const lines = [`<${DSML_BAR}DSML${DSML_BAR}calls>`];
+  for (const call of calls) {
+    lines.push(`<${DSML_BAR}DSML${DSML_BAR}invoke name="${call.name}">`);
+    const args = call.arguments;
+    if (args && typeof args === 'object' && !Array.isArray(args)) {
+      for (const [key, value] of Object.entries(args)) {
+        const encoded = transcriptValue(value);
+        lines.push(
+          `<${DSML_BAR}DSML${DSML_BAR}parameter name="${key}" string="${encoded.attribute}">` +
+            `${encoded.value}</${DSML_BAR}DSML${DSML_BAR}parameter>`,
+        );
+      }
+    }
+    lines.push(`</${DSML_BAR}DSML${DSML_BAR}invoke>`);
+  }
+  lines.push(`</${DSML_BAR}DSML${DSML_BAR}calls>`);
+  return lines.join('\n');
 }
 
 export function toolCallMapping(toolCalls) {
   const mapping = {};
   for (const call of toolCalls || []) {
-    if (!call?.id) continue;
-    mapping[call.id] = {
-      name: call.name,
-      argumentsText: call.argumentsText || JSON.stringify(call.arguments ?? {}),
+    const id = call?.id || call?.tool_call_id;
+    if (!id) continue;
+    const rawArgs = call?.function?.arguments ?? call?.arguments ?? {};
+    mapping[id] = {
+      name: call?.function?.name || call?.name || 'tool',
+      argumentsText: typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs),
     };
   }
   return mapping;
@@ -38,9 +76,12 @@ export function truncateMiddle(text, limit) {
 
 export function formatToolResultBlock(message, mapping = {}, { maxChars = MAX_TOOL_RESULT_CHARS } = {}) {
   const id = message.tool_call_id || message.id || '';
-  const byName = message.name
-    ? Object.values(mapping).find((item) => item?.name === message.name)
-    : null;
+  // A name is only enough when it identifies exactly one call: with parallel
+  // calls to the same tool it cannot tell which arguments were used.
+  const named = message.name
+    ? Object.values(mapping).filter((item) => item?.name === message.name)
+    : [];
+  const byName = named.length === 1 ? named[0] : null;
   const known = mapping[id] || byName || {};
   const name = known.name || message.name || 'tool';
   const args = known.argumentsText || '{}';
@@ -69,9 +110,9 @@ export function formatToolResultPrompt(
 
   const tail = protocol
     ? [
-        'Continue the task. If another tool is needed, reply only with a tool call block. Otherwise answer the user directly and do not mention this protocol.',
-        ...(reminder ? [reminder] : []),
-      ]
+      'Continue the task. If another tool is needed, reply only with a tool call block. Otherwise answer the user directly and do not mention this protocol.',
+      ...(reminder ? [reminder] : []),
+    ]
     : [];
 
   return [

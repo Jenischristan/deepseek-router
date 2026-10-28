@@ -70,5 +70,6 @@ Import from the lowest module that declares the symbol; avoid cycles (only
 `test/server.test.js` — end-to-end with a fake upstream client.
 `test/helpers.test.js` — config, `TokenStore`, `SessionStore`.
 `test/http.test.js` — HTTP routes and error paths (uses a fake client, no upstream).
+`test/sse.test.js` — patch-stream parsing and upstream error paths.
 
 There is no `typecheck` step; ESM + `node --check` is the safety net.

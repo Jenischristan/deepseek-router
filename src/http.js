@@ -509,8 +509,6 @@ export function createServer({ config, tokenStore, client }) {
     res.on('close', onClose);
 
     let sessionId = null;
-    let parentMessageId = null;
-    let prompt = '';
     let upstream = null;
     let usedAccount = null;
     let acquired = false;
@@ -655,8 +653,6 @@ export function createServer({ config, tokenStore, client }) {
         }
 
         sessionId = attemptSessionId;
-        parentMessageId = attemptParentMessageId;
-        prompt = attemptPrompt;
         break;
       }
 
@@ -678,18 +674,45 @@ export function createServer({ config, tokenStore, client }) {
           requiredName,
         });
 
+      // The model sometimes writes the call inside its THINK fragment. Parse
+      // that too (and strip the markup from reasoning) instead of showing raw
+      // tags while never executing the call.
+      const interpretAttempt = (result) => {
+        const text = fragmentsText(result.fragments);
+        let interp = interpretFor(text.content, result);
+        let reasoning = text.reasoning;
+
+        // Only a THINK fragment is the model's own plan. SEARCH/TIP fragments
+        // can contain arbitrary retrieved text, so never execute a call found
+        // there; still strip markup from the reasoning shown to the client.
+        const thinking = (result.fragments || [])
+          .filter((fragment) => fragment.type && /^THINK/i.test(fragment.type))
+          .map((fragment) => fragment.content || '')
+          .join('');
+        if (thinking && splitAtToolMarker(thinking).found) {
+          const fromThinking = interpretFor(thinking, result);
+          if (
+            (fromThinking.calls.length || fromThinking.invalidCalls.length) &&
+            !interp.calls.length &&
+            !interp.invalidCalls.length
+          ) {
+            // Reasoning is not assistant content: keep only the visible
+            // RESPONSE text (usually empty) when the call came from THINK.
+            interp = { ...fromThinking, content: text.content };
+          }
+        }
+        if (reasoning && splitAtToolMarker(reasoning).found) {
+          reasoning = interpretFor(reasoning, result).content;
+        }
+        return { result, raw: text.content, reasoning, interp };
+      };
+
       // Interprets the model's reply; when it is not executable (unknown tool,
       // unreadable JSON, missing/ill-typed arguments, a required call that never
       // came) asks the same upstream conversation to resend it. Nothing has been
       // executed or shown for those, so the client only ever sees the fixed one.
       const settleToolTurn = async (firstResult) => {
-        const first = fragmentsText(firstResult.fragments);
-        let latest = {
-          result: firstResult,
-          raw: first.content,
-          reasoning: first.reasoning,
-          interp: interpretFor(first.content, firstResult),
-        };
+        let latest = interpretAttempt(firstResult);
         const attempts = [latest];
         let repairs = 0;
 
@@ -726,13 +749,7 @@ export function createServer({ config, tokenStore, client }) {
               account: usedAccount,
             });
             const result = await consumeDeepSeekStream(response);
-            const text = fragmentsText(result.fragments);
-            latest = {
-              result,
-              raw: text.content,
-              reasoning: text.reasoning,
-              interp: interpretFor(text.content, result),
-            };
+            latest = interpretAttempt(result);
             attempts.push(latest);
           } catch (error) {
             if (controller.signal.aborted) throw error;
@@ -762,6 +779,13 @@ export function createServer({ config, tokenStore, client }) {
           );
         }
         for (const item of interp.renamed) log.debug(`tool name "${item.from}" -> "${item.to}"`);
+        for (const call of interp.calls) {
+          if (call.repaired) {
+            log.warn(
+              `executing tool "${call.name}" with repaired JSON (the model's arguments were not valid JSON)`,
+            );
+          }
+        }
 
         let toolCalls = interp.calls.map((call) => ({ ...call, id: makeToolCallId() }));
         if (!parallelToolCalls && toolCalls.length > 1) {
@@ -876,6 +900,9 @@ export function createServer({ config, tokenStore, client }) {
       let emittedContent = '';
       let emittedReasoning = '';
       const filter = parsing ? new ToolCallStreamFilter({ holdAll: requireCall }) : null;
+      // A call written inside the reasoning fragment is parsed at the end; hold
+      // its markup back so the client never sees raw tool tags either way.
+      const reasoningFilter = parsing ? new ToolCallStreamFilter() : null;
 
       const emitContent = (text) => {
         if (!text) return;
@@ -889,14 +916,16 @@ export function createServer({ config, tokenStore, client }) {
       const firstResult = await consumeDeepSeekStream(upstream, {
         onDelta(field, text) {
           if (field === 'reasoning') {
-            emittedReasoning += text;
+            const visible = reasoningFilter ? reasoningFilter.push(text) : text;
+            if (!visible) return;
+            emittedReasoning += visible;
             sseWrite(
               res,
               chunk({
                 id,
                 model: model.id,
                 created,
-                delta: { reasoning_content: text },
+                delta: { reasoning_content: visible },
               }),
             );
           } else if (filter) {
@@ -910,6 +939,21 @@ export function createServer({ config, tokenStore, client }) {
       if (filter) {
         const held = filter.takeHeld();
         if (held.pending) emitContent(held.pending);
+      }
+      if (reasoningFilter) {
+        const held = reasoningFilter.takeHeld();
+        if (held.pending) {
+          emittedReasoning += held.pending;
+          sseWrite(
+            res,
+            chunk({
+              id,
+              model: model.id,
+              created,
+              delta: { reasoning_content: held.pending },
+            }),
+          );
+        }
       }
 
       let best;

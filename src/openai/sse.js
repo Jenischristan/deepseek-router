@@ -1,3 +1,5 @@
+import { UpstreamError } from '../errors.js';
+
 // DeepSeek SSE stream parser
 // ===========================================================================
 
@@ -16,11 +18,12 @@ export async function consumeDeepSeekStream(response, handlers = {}) {
     done: false,
   };
 
-  let finished = false;
-
   const emit = (fragment, text) => {
     if (!text) return;
-    const field = fragment.type === 'THINK' ? 'reasoning' : 'content';
+    // Only RESPONSE fragments are assistant answer text. THINK, SEARCH, TIP and
+    // any future non-answer fragment type stay out of content (and out of the
+    // tool-call parser), otherwise raw markup/search notes leak to the client.
+    const field = !fragment.type || fragment.type === 'RESPONSE' ? 'content' : 'reasoning';
     handlers.onDelta?.(field, text, fragment);
   };
 
@@ -279,30 +282,25 @@ export async function consumeDeepSeekStream(response, handlers = {}) {
     }
   }
 
-  if (!finished) {
-    finished = true;
-    const result = {
-      status: state.status || (state.done ? 'FINISHED' : 'INCOMPLETE'),
-      totalTokens: state.totalTokens,
-      responseMessageId: state.responseMessageId,
-      requestMessageId: state.requestMessageId,
-      title: state.title,
-      modelType: state.modelType,
-      fragments: state.fragments.map((fragment) => ({ ...fragment })),
-    };
-    handlers.onFinish?.(result);
-    return result;
-  }
-
-  return null;
+  const result = {
+    status: state.status || (state.done ? 'FINISHED' : 'INCOMPLETE'),
+    totalTokens: state.totalTokens,
+    responseMessageId: state.responseMessageId,
+    requestMessageId: state.requestMessageId,
+    title: state.title,
+    modelType: state.modelType,
+    fragments: state.fragments.map((fragment) => ({ ...fragment })),
+  };
+  handlers.onFinish?.(result);
+  return result;
 }
 
 export function fragmentsText(fragments) {
   let content = '';
   let reasoning = '';
   for (const fragment of fragments || []) {
-    if (fragment.type === 'THINK') reasoning += fragment.content || '';
-    else content += fragment.content || '';
+    if (!fragment.type || fragment.type === 'RESPONSE') content += fragment.content || '';
+    else reasoning += fragment.content || '';
   }
   return { content, reasoning };
 }

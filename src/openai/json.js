@@ -342,6 +342,18 @@ export function parseLooseValues(text) {
   return values;
 }
 
+function imagePlaceholder(part) {
+  const raw =
+    part.type === 'image_url' || part.type === 'input_image'
+      ? part.image_url && typeof part.image_url === 'object'
+        ? part.image_url.url
+        : part.image_url ?? part.url
+      : null;
+  if (typeof raw !== 'string' || !raw) return null;
+  const remote = /^https?:\/\//i.test(raw) && raw.length <= 300;
+  return remote ? `[Image attachment: ${raw}]` : '[Image attachment]';
+}
+
 export function messageContentText(content) {
   if (content == null) return '';
   if (typeof content === 'string') return content;
@@ -352,8 +364,9 @@ export function messageContentText(content) {
       if (typeof part === 'string') {
         parts.push(part);
       } else if (part && typeof part === 'object') {
-        if (typeof part.text === 'string') parts.push(part.text);
-        else if (part.type === 'image_url') parts.push('[Image attachment omitted]');
+        const image = imagePlaceholder(part);
+        if (image) parts.push(image);
+        else if (typeof part.text === 'string') parts.push(part.text);
         else parts.push(stableStringify(part));
       }
     }
@@ -361,6 +374,8 @@ export function messageContentText(content) {
   }
   if (typeof content === 'object') {
     if (typeof content.text === 'string') return content.text;
+    const image = imagePlaceholder(content);
+    if (image) return image;
     return stableStringify(content);
   }
   return String(content);

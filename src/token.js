@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { CONFIG_FILE, normalizeAccounts } from './config.js';
+import { configFilePath, normalizeAccounts } from './config.js';
 
 const RELOAD_INTERVAL_MS = 5000;
 
@@ -26,7 +26,7 @@ export class TokenStore {
     this.tokenFile = cfg.tokenFile || '';
     // `null` disables disk reloads, which tests use to stay hermetic. The
     // default keeps watching the user's config file.
-    this.configFile = 'configFile' in cfg ? cfg.configFile : CONFIG_FILE;
+    this.configFile = 'configFile' in cfg ? cfg.configFile : configFilePath();
     this._lastCheck = 0;
     this._fileMtime = 0;
     this._configMtime = 0;

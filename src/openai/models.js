@@ -2,6 +2,7 @@
 // ===========================================================================
 
 import crypto from 'node:crypto';
+import { messageContentText } from './json.js';
 import { formatToolCallsForTranscript } from './transcript.js';
 const CREATED = 1704067200;
 
@@ -129,51 +130,22 @@ export function dataUrlToBuffer(image) {
   return buffer.length ? buffer : null;
 }
 
-export function contentToText(content) {
-  if (content == null) return '';
-  if (typeof content === 'string') return content;
-  if (typeof content === 'number' || typeof content === 'boolean') {
-    return String(content);
-  }
-  if (Array.isArray(content)) {
-    const parts = [];
-    for (const part of content) {
-      if (typeof part === 'string') {
-        parts.push(part);
-      } else if (part && typeof part === 'object') {
-        if (part.type === 'text' || part.type === 'input_text') {
-          if (typeof part.text === 'string') parts.push(part.text);
-        } else if (imageUrlOf(part)) {
-          const url = imageUrlOf(part);
-          const remote =
-            typeof url === 'string' && /^https?:\/\//i.test(url) && url.length <= 300;
-          parts.push(remote ? `[Image attachment: ${url}]` : '[Image attachment]');
-        } else if (typeof part.text === 'string') {
-          parts.push(part.text);
-        }
-      }
-    }
-    return parts.join('\n');
-  }
-  if (typeof content === 'object') {
-    if (typeof content.text === 'string') return content.text;
-    return JSON.stringify(content);
-  }
-  return String(content);
-}
+// Kept as a named export for callers; the implementation is shared with
+// tool-result and cache text so the two can never disagree.
+export const contentToText = messageContentText;
 
 function roleLabel(role) {
   switch (role) {
-    case 'assistant':
-      return 'Assistant';
-    case 'system':
-    case 'developer':
-      return 'System';
-    case 'tool':
-    case 'function':
-      return 'Tool';
-    default:
-      return 'User';
+  case 'assistant':
+    return 'Assistant';
+  case 'system':
+  case 'developer':
+    return 'System';
+  case 'tool':
+  case 'function':
+    return 'Tool';
+  default:
+    return 'User';
   }
 }
 

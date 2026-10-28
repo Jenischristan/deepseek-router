@@ -11,7 +11,11 @@ function normalizeArguments(value) {
     if (!trimmed) return { arguments: {}, argumentsText: '{}' };
     const parsed = looseJsonParse(trimmed);
     if (parsed.ok) {
-      return { arguments: parsed.value, argumentsText: JSON.stringify(parsed.value) };
+      return {
+        arguments: parsed.value,
+        argumentsText: JSON.stringify(parsed.value),
+        ...(parsed.repaired ? { repaired: true } : {}),
+      };
     }
     return { arguments: {}, argumentsText: '{}', rawArguments: trimmed };
   }
@@ -45,18 +49,30 @@ function flatArguments(payload, tools = []) {
 function inferToolName(args, tools, preferredName) {
   const candidates = (tools || []).filter((tool) => tool && typeof tool.name === 'string');
   if (!candidates.length || !isPlainObject(args)) return null;
-  if (candidates.length === 1) return candidates[0].name;
 
   const keys = Object.keys(args);
+  const fitsTool = (tool, { allowExtra = false } = {}) => {
+    const aligned = alignArguments(args, tool.parameters || {}, { guess: false });
+    if (aligned.missing.length) return null;
+    if (aligned.leftover.length && !allowExtra) return null;
+    // A tool must still look like it was called with one of its own
+    // parameters; otherwise any stray JSON answer becomes a call.
+    if (keys.length && aligned.matched === 0) return null;
+    return aligned;
+  };
+
+  if (candidates.length === 1) {
+    // A lone tool can receive extra arguments (e.g. workdir folded into a
+    // command); it just needs to satisfy the schema and use one real parameter.
+    return fitsTool(candidates[0], { allowExtra: true }) ? candidates[0].name : null;
+  }
   if (!keys.length) return null;
 
   const scored = candidates.map((tool) => {
-    const aligned = alignArguments(args, tool.parameters || {}, { guess: false });
-    const fits = aligned.missing.length === 0 && aligned.leftover.length === 0;
-    let score = aligned.matched * 2 - aligned.leftover.length * 3 - aligned.missing.length * 3;
-    if (fits) score += 10;
-    if (preferredName && tool.name === preferredName) score += 5;
-    return { name: tool.name, score, fits };
+    const aligned = fitsTool(tool);
+    let score = aligned ? aligned.matched * 2 + 10 : -1;
+    if (score >= 0 && preferredName && tool.name === preferredName) score += 5;
+    return { name: tool.name, score, fits: Boolean(aligned) };
   });
 
   scored.sort((a, b) => b.score - a.score);
@@ -92,7 +108,9 @@ export function extractCalls(payload, context = {}) {
   let name;
   let args;
   let nameKey = null;
+  let nestedFunction = false;
   if (isPlainObject(payload.function)) {
+    nestedFunction = true;
     name = payload.function.name;
     args =
       payload.function.arguments ?? payload.function.parameters ?? payload.function.args;
@@ -124,6 +142,33 @@ export function extractCalls(payload, context = {}) {
     }
   }
 
+  // A parameter can itself be called "name", "tool", "input" or "function".
+  // Only treat the value as an envelope when it names a real tool or is
+  // accompanied by an arguments key; otherwise the payload is bare arguments.
+  if (
+    !nestedFunction &&
+    name &&
+    nameKey &&
+    context.tools?.length &&
+    !context.lookupTool?.(name) &&
+    !ARG_KEYS.some((key) => key !== nameKey && has(payload, key))
+  ) {
+    const flat = flatArguments(payload, context.tools);
+    const inferred = inferToolName(flat, context.tools, context.preferredName);
+    if (inferred) {
+      const normalized = normalizeArguments(flat);
+      const call = {
+        name: inferred,
+        inferredName: true,
+        arguments: normalized.arguments,
+        argumentsText: normalized.argumentsText,
+        ...(normalized.repaired ? { repaired: true } : {}),
+      };
+      if (normalized.rawArguments) call.rawArguments = normalized.rawArguments;
+      return [call];
+    }
+  }
+
   if (typeof name !== 'string' || !name.trim()) {
     if (context.allowInference === false) return [];
     const flat = flatArguments(payload, context.tools);
@@ -135,6 +180,7 @@ export function extractCalls(payload, context = {}) {
       inferredName: true,
       arguments: normalized.arguments,
       argumentsText: normalized.argumentsText,
+      ...(normalized.repaired ? { repaired: true } : {}),
     };
     if (normalized.rawArguments) call.rawArguments = normalized.rawArguments;
     return [call];
@@ -145,6 +191,7 @@ export function extractCalls(payload, context = {}) {
     name: name.trim(),
     arguments: normalized.arguments,
     argumentsText: normalized.argumentsText,
+    ...(normalized.repaired ? { repaired: true } : {}),
   };
   if (normalized.rawArguments) call.rawArguments = normalized.rawArguments;
   return [call];
@@ -167,7 +214,7 @@ export function extractCalls(payload, context = {}) {
 
 const DSML_NAMES = 'tool_calls|function_calls|calls|invoke|parameter';
 const DSML_PREFIX = String.raw`\s*(?:[｜|]\s*){0,3}DSML\s*(?:[｜|]\s*){0,3}`;
-const PREFIXED_TAG_SRC = String.raw`<(\/?)${DSML_PREFIX}(${DSML_NAMES})(?![A-Za-z0-9_])([^>]*)>`;
+export const PREFIXED_TAG_SRC = String.raw`<(\/?)${DSML_PREFIX}(${DSML_NAMES})(?![A-Za-z0-9_])([^>]*)>`;
 const BARE_TAG_SRC = String.raw`<(\/?)(${DSML_NAMES})(?![A-Za-z0-9_])([^>]*)>`;
 const DSML_ANY_TAG_RE = new RegExp(String.raw`<\/?${DSML_PREFIX}[^>]*>`, 'gi');
 const DSML_PARTIAL_TAIL_RE = new RegExp(String.raw`<\/?${DSML_PREFIX}[^>]*$`, 'i');
@@ -292,9 +339,13 @@ function walkDslTokens(text, tokens) {
     const token = tokens[t];
 
     if (token.kind === 'calls') {
-      touch(token.start, token.end);
-      if (token.closing) {
-        if (current) closeCurrent(token.start, token.start, 'implicit');
+      if (!token.closing) {
+        touch(token.start, token.end);
+        continue;
+      }
+      if (current) closeCurrent(token.start, token.start, 'implicit');
+      if (regionStart !== null) {
+        touch(token.start, token.end);
         spans.push([regionStart, regionEnd]);
         regionStart = null;
       }
@@ -556,6 +607,17 @@ function parseDslBlocks(text, context) {
 
 export function extractDsml(text, context = {}) {
   const parsed = parseDslBlocks(text, context);
+  // With no parsed call and no failed attempt, DSML-looking text is prose (a
+  // model explaining the protocol, an example in a code block). Keep it
+  // verbatim, even if an empty calls wrapper was seen; only remove a marker
+  // that was cut off at the end of the reply.
+  if (!parsed.calls.length && !parsed.invalid.length) {
+    const content = text
+      .replace(DSML_PARTIAL_TAIL_RE, '')
+      .replace(/<tool_call\b[^>]*$/i, '')
+      .trim();
+    return { calls: [], content, invalid: [] };
+  }
   let content = parsed.spans.length ? removeSpans(text, parsed.spans) : text;
   content = content.replace(DSML_ANY_TAG_RE, '');
   content = content.replace(DSML_PARTIAL_TAIL_RE, '');

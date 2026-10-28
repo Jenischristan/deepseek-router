@@ -245,16 +245,16 @@ and `edit`.
 The web endpoint has no tool protocol, so the router emulates one:
 
 1. OpenAI `tools`/`functions` definitions are rendered into a prompt protocol.
-   The model is asked to answer with a JSON block:
-   `<tool_call>{"calls":[{"name":"...","arguments":{...}}]}</tool_call>`.
-2. DeepSeek's native DSML tool format is also accepted. The parser tolerates
-   ASCII or full-width bars (1-3 on either side), `calls`/`tool_calls`/
-   `function_calls`, V4.1 spaced tags such as `<｜｜DSML｜｜ invoke>`, and invokes
-   without an outer block: `<｜｜DSML｜｜ calls>` / `<invoke name="...">` /
-   `<parameter ...>` blocks. Plain `<parameter>` and prefixed
-   `<｜｜DSML｜｜ parameter>` tags are both handled. `string="true"` values are kept
-   verbatim (whitespace matters for edits); `string="false"` or a missing
-   attribute is parsed as JSON with a raw-text fallback.
+   The model is asked to answer with DeepSeek DSML:
+   `<｜DSML｜calls><｜DSML｜invoke name="..."><｜DSML｜parameter ...>...`.
+   The JSON form `<tool_call>{"calls":[...]}</tool_call>` remains an accepted
+   fallback.
+2. The parser accepts DSML with ASCII or full-width bars (1-3 on either side),
+   `calls`/`tool_calls`/`function_calls`, and invokes without an outer block.
+   Plain `<parameter>` and prefixed `<｜DSML｜parameter>` tags are both handled.
+   `string="true"` values are kept verbatim (whitespace matters for edits);
+   `string="false"` or a missing attribute is parsed as JSON with a raw-text
+   fallback.
 3. Bare argument objects are accepted too. `<tool_call>{"command":"ls"}</tool_call>`,
    newline-separated objects, and trailing stray braces are matched to the tool
    whose schema best fits the arguments (with `tool_choice` as a tie-breaker).
@@ -272,8 +272,9 @@ Malformed DSML is recovered conservatively: a missing `</invoke>` resynchronizes
 on the next invoke (so one call cannot swallow the next), a missing outer close
 still yields its complete invokes, repeated parameters become separate calls,
 and a complete parameter left outside an invoke is recovered. An unterminated
-parameter value is rejected instead of being executed. Tool markup inside
-` thinking` is ignored and never leaks into assistant content.
+parameter value is rejected instead of being executed. A complete tool call
+inside ` thinking` is executed, while the markup is stripped from the returned
+reasoning and never leaks into assistant content.
 
 Supported controls: `tool_choice` (`auto`, `none`, `required`, or a specific
 function), legacy `functions`/`function_call`, and `parallel_tool_calls`.
@@ -312,7 +313,8 @@ normal web client and avoids hammering the web API.
 ## Configuration
 
 The router reads `~/.config/deepseek-router/config.json` (or `config.json` in
-this directory), plus environment variables. Environment variables win.
+this directory), plus environment variables. Environment variables win. Set
+`DEEPSEEK_ROUTER_CONFIG_FILE` to read only a specific config file.
 
 | Key | Env | Default | Meaning |
 | --- | --- | --- | --- |
@@ -329,7 +331,7 @@ this directory), plus environment variables. Environment variables win.
 | `sessionTtlMs` | `SESSION_TTL_MS` | `21600000` | Session cache lifetime (6h) |
 | `maxSessions` | `MAX_SESSIONS` | `500` | Session cache size |
 | `injectToolPrompt` | `INJECT_TOOL_PROMPT` | `true` | Add the tool-use protocol to the prompt; `false` leaves tool parsing on but injects nothing |
-| `parseToolCalls` | `PARSE_TOOL_CALLS` | `true` | Convert ``/DSML output into `tool_calls`; `false` returns the raw text |
+| `parseToolCalls` | `PARSE_TOOL_CALLS` | `true` | Convert DSML or JSON tool markup into `tool_calls`; `false` returns the raw text |
 | `repairToolCalls` | `REPAIR_TOOL_CALLS` | `true` | Ask the model to resend an unusable tool call instead of returning it broken |
 | `maxToolRepairs` | `MAX_TOOL_REPAIRS` | `2` | Maximum repair attempts per turn (clamped to 0-5) |
 | `accountSwitchAfter` | `DEEPSEEK_ACCOUNT_SWITCH_AFTER` | `0` | Rotate after N assistant messages per account (0 disables) |

@@ -1,4 +1,4 @@
-import { has, isPlainObject, toolChoiceMode } from './json.js';
+import { has, isPlainObject, stableStringify, toolChoiceMode } from './json.js';
 import { describeType, normalizeIdentifier, primaryType } from './schema.js';
 import { truncateMiddle } from './transcript.js';
 
@@ -12,17 +12,17 @@ function oneLine(text, limit) {
 
 function placeholderFor(schema, key) {
   switch (primaryType(schema)) {
-    case 'integer':
-    case 'number':
-      return 1;
-    case 'boolean':
-      return true;
-    case 'array':
-      return [];
-    case 'object':
-      return {};
-    default:
-      return `<${key}>`;
+  case 'integer':
+  case 'number':
+    return 1;
+  case 'boolean':
+    return true;
+  case 'array':
+    return [];
+  case 'object':
+    return {};
+  default:
+    return `<${key}>`;
   }
 }
 
@@ -49,13 +49,29 @@ function pickExampleTool(tools, preferredName) {
   return best || tools[0];
 }
 
+const DSML_BAR = '\uFF5C';
+
+function dsmlParameter(key, value, stringType) {
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  return `<${DSML_BAR}DSML${DSML_BAR}parameter name="${key}" string="${stringType}">${text}</${DSML_BAR}DSML${DSML_BAR}parameter>`;
+}
+
 function exampleCall(tools, preferredName) {
   const tool = pickExampleTool(tools, preferredName);
   const properties = isPlainObject(tool.parameters?.properties) ? tool.parameters.properties : {};
   const required = Array.isArray(tool.parameters?.required) ? tool.parameters.required : [];
-  const args = {};
-  for (const key of required) args[key] = placeholderFor(properties[key], key);
-  return `<tool_call>${JSON.stringify({ calls: [{ name: tool.name, arguments: args }] })}</tool_call>`;
+  const params = required.map((key) => {
+    const value = placeholderFor(properties[key], key);
+    const stringType = typeof value === 'string' ? 'true' : 'false';
+    return dsmlParameter(key, value, stringType);
+  });
+  return [
+    `<${DSML_BAR}DSML${DSML_BAR}calls>`,
+    `<${DSML_BAR}DSML${DSML_BAR}invoke name="${tool.name}">`,
+    ...params,
+    `</${DSML_BAR}DSML${DSML_BAR}invoke>`,
+    `</${DSML_BAR}DSML${DSML_BAR}calls>`,
+  ].join('\n');
 }
 
 // Names models commonly invent from other agent frameworks. Only warned about
@@ -141,21 +157,24 @@ export function formatToolReminder(tools) {
   const body = compact
     ? tools.map((tool) => tool.name).join(', ')
     : tools
-        .map((tool) => {
-          const properties = isPlainObject(tool.parameters?.properties)
-            ? tool.parameters.properties
-            : {};
-          const required = new Set(
-            Array.isArray(tool.parameters?.required) ? tool.parameters.required : [],
-          );
-          const params = Object.keys(properties).map((key) => `${key}${required.has(key) ? '' : '?'}`);
-          const signature = `${tool.name}(${params.join(', ')})`;
-          return signature.length > 160 ? `${signature.slice(0, 157)}…)` : signature;
-        })
-        .join(', ');
+      .map((tool) => {
+        const properties = isPlainObject(tool.parameters?.properties)
+          ? tool.parameters.properties
+          : {};
+        const required = new Set(
+          Array.isArray(tool.parameters?.required) ? tool.parameters.required : [],
+        );
+        const params = Object.keys(properties).map((key) => `${key}${required.has(key) ? '' : '?'}`);
+        const signature = `${tool.name}(${params.join(', ')})`;
+        return signature.length > 160 ? `${signature.slice(0, 157)}…)` : signature;
+      })
+      .join(', ');
   return (
     `[Tool reminder] Available tools: ${body}. ` +
-    'To call tools reply with <tool_call>{"calls":[{"name":"<exact tool name>","arguments":{...}}]}</tool_call> ' +
+    'To call tools reply with DeepSeek DSML markup: ' +
+    `<${DSML_BAR}DSML${DSML_BAR}calls><${DSML_BAR}DSML${DSML_BAR}invoke name="<exact tool name>">` +
+    `<${DSML_BAR}DSML${DSML_BAR}parameter name="<exact parameter name>" string="true">value</${DSML_BAR}DSML${DSML_BAR}parameter>` +
+    `</${DSML_BAR}DSML${DSML_BAR}invoke></${DSML_BAR}DSML${DSML_BAR}calls> ` +
     'and nothing after it. Tool and parameter names are case-sensitive: use them exactly as listed (a "?" marks an optional parameter). ' +
     'Never call a tool that is not in this list.'
   );
@@ -170,23 +189,28 @@ export function buildToolInstructions(tools, { toolChoice = 'auto', parallelTool
   const warning = inventedNameWarning(tools);
   const lines = [
     '[Tool use protocol]',
-    'You can call tools. To call one or more tools, reply with a tool block in exactly this format and put nothing after it:',
-    '<tool_call>{"calls":[{"name":"TOOL_NAME","arguments":{...}}]}</tool_call>',
+    'You can call tools. DeepSeek DSML markup is the preferred format. To call one or more tools, reply with exactly this structure and put nothing after it:',
+    `<${DSML_BAR}DSML${DSML_BAR}calls>`,
+    `<${DSML_BAR}DSML${DSML_BAR}invoke name="TOOL_NAME">`,
+    `<${DSML_BAR}DSML${DSML_BAR}parameter name="PARAMETER_NAME" string="true">value</${DSML_BAR}DSML${DSML_BAR}parameter>`,
+    `</${DSML_BAR}DSML${DSML_BAR}invoke>`,
+    `</${DSML_BAR}DSML${DSML_BAR}calls>`,
     `Format example (tool and values are placeholders, choose whichever listed tool fits the task): ${exampleCall(
       tools,
       choice.mode === 'function' ? choice.name : null,
     )}`,
     'Rules:',
-    '- "name" must be EXACTLY one of the tool names listed below. Names are case-sensitive. Never invent, abbreviate, translate or prefix them (no "functions." or "default_api.").',
+    '- The invoke "name" must be EXACTLY one of the tool names listed below. Names are case-sensitive. Never invent, abbreviate, translate or prefix them (no "functions." or "default_api.").',
     ...(warning ? [warning] : []),
-    '- "arguments" must be a JSON object that uses exactly the parameter names and types declared in the tool schema, includes every required parameter, and matches the declared types (strings in quotes, numbers and booleans unquoted). Do not add parameters that are not listed.',
-    '- Keep the JSON valid: escape newlines as \\n and quotes as \\" inside strings, including multi-line file contents.',
+    '- Every parameter must use exactly the parameter names and types declared in the tool schema, include every required parameter, and omit parameters that are not listed. Put the value between the parameter tags.',
+    '- Use string="true" when the parameter type is string (the value is then taken literally, so no escaping is needed). Use string="false" for numbers, booleans, objects and arrays, with JSON as the value.',
+    '- JSON is accepted only as a fallback: <tool_call>{"calls":[{"name":"TOOL_NAME","arguments":{...}}]}</tool_call>. If you use it, escape newlines as \\n and quotes as \\" inside strings.',
     parallelToolCalls
-      ? '- Independent calls go in the same "calls" array, in the order they should run.'
-      : '- Call at most one tool per tool block.',
+      ? '- Independent calls go in the same calls block, in the order they should run.'
+      : '- Call at most one tool per calls block.',
     '- Do not wrap the block in Markdown, do not narrate it, and never write tool results yourself; results arrive in the next message.',
     '- When no tool is needed, answer normally without a tool block. If no listed tool fits, say so in plain text instead of inventing one.',
-    '- If you emit your native DSML markup instead, the same exact-name rules apply and every tag must be closed.',
+    '- Every DSML tag must be closed. Do not mix DSML and JSON in one reply.',
   ];
 
   if (choice.mode === 'required') {

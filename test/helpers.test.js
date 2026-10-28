@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import test from 'node:test';
+import os from 'node:os';
 
 import { loadConfig, normalizeAccounts } from '../src/config.js';
 import { SessionStore, conversationKey } from '../src/sessions.js';
@@ -12,10 +14,26 @@ const ENV_KEYS = [
   'DEEPSEEK_CLIENT_VERSION',
   'DEEPSEEK_LOCALE',
   'DEEPSEEK_USER_AGENT',
+  'DEEPSEEK_COOKIES',
+  'DEEPSEEK_HIF_LEIM',
+  'DEEPSEEK_TOKEN_FILE',
+  'DEEPSEEK_ROUTER_CONFIG_FILE',
+  'DEEPSEEK_ROUTER_KEY',
   'REPAIR_TOOL_CALLS',
   'MAX_TOOL_REPAIRS',
   'LOG_LEVEL',
+  'HOST',
+  'PORT',
+  'UPSTREAM_MIN_INTERVAL_MS',
+  'UPSTREAM_CONCURRENCY',
+  'SESSION_TTL_MS',
+  'MAX_SESSIONS',
+  'INJECT_TOOL_PROMPT',
+  'PARSE_TOOL_CALLS',
+  'REQUEST_TIMEOUT_MS',
 ];
+
+const MISSING_CONFIG = path.join(os.tmpdir(), 'deepseek-router-test-missing-config.json');
 
 function withEnv(patch, fn) {
   const saved = new Map();
@@ -23,6 +41,7 @@ function withEnv(patch, fn) {
     saved.set(key, process.env[key]);
     delete process.env[key];
   }
+  process.env.DEEPSEEK_ROUTER_CONFIG_FILE = MISSING_CONFIG;
   for (const [key, value] of Object.entries(patch)) process.env[key] = value;
   try {
     return fn();
@@ -122,8 +141,8 @@ test('TokenStore update replaces the active token', () => {
   assert.equal(store.count, 2);
 });
 
-test('SessionStore evicts expired and over-capacity entries', async () => {
-  const sessions = new SessionStore({ ttlMs: 20, max: 2 });
+test('SessionStore evicts expired and over-capacity entries', () => {
+  const sessions = new SessionStore({ ttlMs: 60_000, max: 2 });
   sessions.set('a', { sessionId: '1' });
   sessions.set('b', { sessionId: '2' });
   sessions.set('c', { sessionId: '3' });
@@ -131,7 +150,7 @@ test('SessionStore evicts expired and over-capacity entries', async () => {
   assert.equal(sessions.get('a'), null);
 
   sessions.set('d', { sessionId: '4' });
-  await new Promise((resolve) => setTimeout(resolve, 30));
+  for (const value of sessions.map.values()) value.updatedAt = Date.now() - 120_000;
   assert.equal(sessions.get('d'), null);
   assert.equal(sessions.size, 0);
 });
