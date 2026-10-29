@@ -214,39 +214,81 @@ export function extractCalls(payload, context = {}) {
 
 const DSML_NAMES = 'tool_calls|function_calls|calls|invoke|parameter';
 const DSML_PREFIX = String.raw`\s*(?:[｜|]\s*){0,3}DSML\s*(?:[｜|]\s*){0,3}`;
-export const PREFIXED_TAG_SRC = String.raw`<(\/?)${DSML_PREFIX}(${DSML_NAMES})(?![A-Za-z0-9_])([^>]*)>`;
-const BARE_TAG_SRC = String.raw`<(\/?)(${DSML_NAMES})(?![A-Za-z0-9_])([^>]*)>`;
-const DSML_ANY_TAG_RE = new RegExp(String.raw`<\/?${DSML_PREFIX}[^>]*>`, 'gi');
-const DSML_PARTIAL_TAIL_RE = new RegExp(String.raw`<\/?${DSML_PREFIX}[^>]*$`, 'i');
+// `ATTRS_SRC` stops at a `>` only when it is not inside a quoted value. Models
+// routinely put `</｜DSML｜parameter>` or `>` inside a parameter value; the old
+// `[^>]*` ended the tag there and split the call in half.
+const ATTRS_SRC = String.raw`(?:[^>"']|"[^"]*"|'[^']*')*`;
+const OPEN_TAG_RE = new RegExp(
+  String.raw`<(\/?)${DSML_PREFIX}(${DSML_NAMES})(?![A-Za-z0-9_])(${ATTRS_SRC})>`,
+  'gi',
+);
+const DSML_ANY_TAG_RE = new RegExp(
+  String.raw`<\/?${DSML_PREFIX}(?:${DSML_NAMES})(?![A-Za-z0-9_])${ATTRS_SRC}>`,
+  'gi',
+);
+const DSML_PARTIAL_TAIL_RE = new RegExp(
+  String.raw`<\/?${DSML_PREFIX}(?:${DSML_NAMES})(?![A-Za-z0-9_])${ATTRS_SRC}$`,
+  'i',
+);
 
-function parseAttributes(raw) {
+export function parseAttributes(raw) {
   const attrs = {};
-  const re = /([A-Za-z_][\w:.-]*)\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))/g;
+  const source = raw || '';
+  // Single left-to-right pass with an anchored `lastIndex`. A plain global
+  // regex with the old alternation backtracked per character on a long
+  // unquoted value, which could stall the event loop. This is linear.
+  const re = /([A-Za-z_][\w:.-]*)\s*=\s*/g;
   let match;
-  while ((match = re.exec(raw || '')) !== null) {
-    attrs[match[1].toLowerCase()] = match[3] ?? match[4] ?? match[5] ?? '';
+  while ((match = re.exec(source)) !== null) {
+    const key = match[1].toLowerCase();
+    let value = '';
+    const at = re.lastIndex;
+    const quote = source[at];
+    if (quote === '"' || quote === "'") {
+      const close = source.indexOf(quote, at + 1);
+      if (close === -1) {
+        value = source.slice(at + 1);
+        re.lastIndex = source.length;
+      } else {
+        value = source.slice(at + 1, close);
+        re.lastIndex = close + 1;
+      }
+    } else {
+      // Unquoted: read to whitespace, `>` or a self-closing `/` at the end.
+      let end = at;
+      while (end < source.length && !/[\s>]/.test(source[end])) end += 1;
+      value = source.slice(at, end);
+      re.lastIndex = end;
+    }
+    attrs[key] = value;
   }
   return attrs;
 }
 
-function scanDslTags(text, source) {
-  const re = new RegExp(source, 'gi');
+function scanDslTags(text) {
   const tokens = [];
-  let match;
-  while ((match = re.exec(text)) !== null) {
+  let cursor = 0;
+  for (;;) {
+    OPEN_TAG_RE.lastIndex = cursor;
+    const match = OPEN_TAG_RE.exec(text);
+    if (!match) break;
     const tag = match[2].toLowerCase();
     const attrs = match[3] || '';
     tokens.push({
       kind: tag === 'invoke' ? 'invoke' : tag === 'parameter' ? 'parameter' : 'calls',
       closing: match[1] === '/',
       start: match.index,
-      end: re.lastIndex,
+      end: OPEN_TAG_RE.lastIndex,
       attrs,
       selfClosing: /\/\s*$/.test(attrs),
     });
+    // Never rescan the same characters when a zero-length match is possible.
+    cursor = OPEN_TAG_RE.lastIndex > match.index ? OPEN_TAG_RE.lastIndex : match.index + 1;
   }
   return tokens;
 }
+
+export const PREFIXED_TAG_SRC = OPEN_TAG_RE.source;
 
 function removeSpans(text, spans) {
   const sorted = spans.slice().sort((a, b) => a[0] - b[0]);
@@ -579,11 +621,13 @@ function buildDslCalls(invokes, context) {
 }
 
 function parseDslBlocks(text, context) {
-  let tokens = scanDslTags(text, PREFIXED_TAG_SRC);
+  let tokens = scanDslTags(text);
   let style = 'prefixed';
   if (!tokens.some((token) => token.kind === 'invoke' || token.kind === 'calls')) {
-    // Unprefixed <function_calls><invoke name="..."> (Claude-style markup).
-    tokens = scanDslTags(text, BARE_TAG_SRC);
+    // Unprefixed <function_calls><invoke name="..."> (Claude-style markup). The
+    // prefixed scanner already accepts a bare <invoke>; this second pass exists
+    // for the bare <function_calls> wrapper, so require a real invoke name.
+    tokens = scanDslTags(text);
     style = 'bare';
     if (!tokens.some((token) => token.kind === 'invoke' && !token.closing && /\bname\s*=/i.test(token.attrs))) {
       return { calls: [], invalid: [], spans: [] };

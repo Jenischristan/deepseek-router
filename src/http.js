@@ -118,7 +118,10 @@ function readJsonBody(req) {
         // Respond before dropping the connection. Destroying the socket
         // outright would make the client see a connection reset instead of
         // the 413, so answer first and stop consuming the upload.
-        req.pause();
+        // `resume()` (not `pause()`) is required here: a paused request keeps
+        // the body unread, and with it unread Node never lets the response
+        // finish, so the client ends up seeing ECONNRESET instead of the 413.
+        req.resume();
         return;
       }
       chunks.push(data);
