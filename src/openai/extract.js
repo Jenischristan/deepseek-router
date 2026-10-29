@@ -213,24 +213,37 @@ export function extractCalls(payload, context = {}) {
 // ---------------------------------------------------------------------------
 
 const DSML_NAMES = 'tool_calls|function_calls|calls|invoke|parameter';
-const DSML_PREFIX = String.raw`\s*(?:[｜|]\s*){0,3}DSML\s*(?:[｜|]\s*){0,3}`;
+// Transport corruption sometimes injects zero-width characters between the
+// bars and the DSML marker (copy/paste, tokenizers, chat UIs). They are not
+// meaningful, so treat them like whitespace everywhere a marker is matched.
+const GAP = String.raw`[\s\u200B-\u200D]*`;
+const DSML_PREFIX = `${GAP}(?:[｜|]${GAP}){0,3}DSML${GAP}(?:[｜|]${GAP}){0,3}`;
 // A name-agnostic prefix for cleanup: any DSML marker, any following tag name.
-const DSML_PREFIX_ANY = String.raw`\s*(?:[｜|]\s*){0,3}DSML\s*(?:[｜|]\s*){0,3}`;
+const DSML_PREFIX_ANY = DSML_PREFIX;
 
 // `ATTRS_SRC` stops at a `>` only when it is not inside a quoted value. Models
 // routinely put `</｜DSML｜parameter>` or `>` inside a parameter value; the old
 // `[^>]*` ended the tag there and split the call in half.
 const ATTRS_SRC = String.raw`(?:[^>"']|"[^"]*"|'[^']*')*`;
 const OPEN_TAG_RE = new RegExp(
-  String.raw`<(\/?)${DSML_PREFIX}(${DSML_NAMES})(?![A-Za-z0-9_])(${ATTRS_SRC})>`,
+  String.raw`<(/?)${DSML_PREFIX}(${DSML_NAMES})(?![A-Za-z0-9_])(${ATTRS_SRC})>`,
   'gi',
 );
+// Cleanup is deliberately more tolerant than the parser: transport corruption
+// can drop the leading `<`, and leaving `｜DSML｜calls>` in assistant content is
+// worse than removing a fragment that merely looks like the protocol.
 const DSML_ANY_TAG_RE = new RegExp(
-  String.raw`<\/?` + DSML_PREFIX_ANY + String.raw`[^>]*>`,
+  [
+    String.raw`<\/?` + DSML_PREFIX_ANY + '[^>]*>',
+    `(?:[｜|]${GAP}){1,3}DSML${GAP}(?:[｜|]${GAP}){0,3}[A-Za-z_][\\w:.-]*[^<>]*>`,
+    `DSML${GAP}(?:[｜|]${GAP}){0,3}(?:${DSML_NAMES})(?![A-Za-z0-9_])[^<>]*>`,
+  ].join('|'),
   'gi',
 );
+// A cut-off trailing marker is removed even when the leading angle bracket or
+// the tag name itself is truncated.
 const DSML_PARTIAL_TAIL_RE = new RegExp(
-  String.raw`<\/?${DSML_PREFIX}(?:${DSML_NAMES})(?![A-Za-z0-9_])${ATTRS_SRC}$`,
+  `(?:<\\/?${DSML_PREFIX}|(?:[｜|]${GAP}){1,3}DSML${GAP}(?:[｜|]${GAP}){0,3})${ATTRS_SRC}$`,
   'i',
 );
 
@@ -268,25 +281,64 @@ export function parseAttributes(raw) {
   return attrs;
 }
 
+// A garbled opener often looks like `<parameter command" string="true">`:
+// the `name=` was dropped and the parameter name sits where an attribute key
+// would be. Recover it rather than treating the value as unnamed markup.
+function parameterName(attrs, parsed) {
+  const explicit = (parsed.name || '').trim();
+  if (explicit) return explicit;
+  const bare = /^\s*([A-Za-z_][\w:.-]*)\s*["']/.exec(attrs || '');
+  return bare ? bare[1] : '';
+}
+
+// Matches a whole tag, including tags whose name was garbled away
+// (`<｜DSML｜ command" string="true">`). Those are recovered as parameters.
+// The garbled alternative stops at the first `>` because its quotes are
+// unbalanced by definition; the named alternative keeps the quoted-`>` aware
+// attribute grammar.
+const DSML_TAG_RE = new RegExp(
+  `<(/?)${DSML_PREFIX}(?:(${DSML_NAMES})(?![A-Za-z0-9_])(${ATTRS_SRC})|([^>]*))>`,
+  'gi',
+);
+
 function scanDslTags(text) {
   const tokens = [];
   let cursor = 0;
   for (;;) {
-    OPEN_TAG_RE.lastIndex = cursor;
-    const match = OPEN_TAG_RE.exec(text);
+    DSML_TAG_RE.lastIndex = cursor;
+    const match = DSML_TAG_RE.exec(text);
     if (!match) break;
-    const tag = match[2].toLowerCase();
-    const attrs = match[3] || '';
-    tokens.push({
-      kind: tag === 'invoke' ? 'invoke' : tag === 'parameter' ? 'parameter' : 'calls',
-      closing: match[1] === '/',
-      start: match.index,
-      end: OPEN_TAG_RE.lastIndex,
-      attrs,
-      selfClosing: /\/\s*$/.test(attrs),
-    });
+    const closing = match[1] === '/';
+    let kind;
+    let attrs = '';
+    let garbled = false;
+    if (match[2]) {
+      const tag = match[2].toLowerCase();
+      kind = tag === 'invoke' ? 'invoke' : tag === 'parameter' ? 'parameter' : 'calls';
+      attrs = match[3] || '';
+    } else {
+      const body = match[4] || '';
+      // Missing tag name: only treat it as a parameter when the body still
+      // looks like attributes (a bare name plus a quote, or key=value).
+      if (!closing && /[A-Za-z_][\w:.-]*\s*=|["']/.test(body)) {
+        kind = 'parameter';
+        attrs = body;
+        garbled = true;
+      }
+    }
+    if (kind) {
+      tokens.push({
+        kind,
+        closing,
+        garbled,
+        start: match.index,
+        end: DSML_TAG_RE.lastIndex,
+        attrs,
+        selfClosing: /\/\s*$/.test(attrs),
+      });
+    }
     // Never rescan the same characters when a zero-length match is possible.
-    cursor = OPEN_TAG_RE.lastIndex > match.index ? OPEN_TAG_RE.lastIndex : match.index + 1;
+    cursor = DSML_TAG_RE.lastIndex > match.index ? DSML_TAG_RE.lastIndex : match.index + 1;
   }
   return tokens;
 }
@@ -415,13 +467,27 @@ function walkDslTokens(text, tokens) {
 
     // parameter
     if (token.closing) continue;
-    const target = current || invokes[invokes.length - 1] || null;
-    if (!target) continue;
+    let target = current || invokes[invokes.length - 1] || null;
+    if (!target) {
+      // Parameters with no invoke at all: accumulate them into a synthetic
+      // invoke so the tool can still be inferred from the schema instead of
+      // throwing the arguments away.
+      target = {
+        name: '',
+        params: [],
+        bodyStart: token.start,
+        bodyEnd: token.start,
+        body: '',
+        state: 'closed',
+        synthetic: true,
+      };
+      invokes.push(target);
+    }
     const attrs = parseAttributes(token.attrs);
     const found = findParamEnd(text, tokens, t);
     touch(token.start, found.consumedEnd);
     target.params.push({
-      name: (attrs.name || '').trim(),
+      name: parameterName(token.attrs, attrs),
       stringAttr: attrs.string,
       raw: text.slice(token.end, found.valueEnd),
       recovered: found.recovered,
@@ -453,6 +519,49 @@ function stripUnknownClosers(text) {
   return text.replace(DSML_UNKNOWN_CLOSER_RE, (m, name) =>
     known.has(String(name).toLowerCase()) ? m : '',
   );
+}
+
+const MARKER_FRAGMENT_RES = [
+  new RegExp(`(?:[｜|]${GAP}){1,3}DSML`, 'i'),
+  new RegExp(`DSML${GAP}(?:[｜|]${GAP}){0,3}(?:${DSML_NAMES})(?![A-Za-z0-9_])`, 'i'),
+  new RegExp(String.raw`<\/?\s*DSML`, 'i'),
+  // Transport corruption can drop the `<` from a garbled opener, leaving a
+  // bare tag name plus attributes (`aDSML timeout" string="false">`).
+  new RegExp(`DSML${GAP}[A-Za-z_][\\w:.-]*${GAP}(?:["'=/>])`, 'i'),
+];
+
+// A parameter value may legitimately contain a balanced literal tag
+// (`echo <parameter ...>x</parameter>`). Anything else that still looks like
+// DSML markup means the value swallowed a broken neighbouring tag, and running
+// the tool with it would execute protocol garbage.
+function hasBrokenDsmlMarkup(value) {
+  const source = stripUnknownClosers(String(value ?? ''));
+  if (!source) return false;
+  // Transcript replay JSON-encodes values containing markup and escapes every
+  // literal `<` as \u003c. Such a value is safe text, not protocol markup.
+  const trimmed = source.trim();
+  if (/^["[{]/.test(trimmed) && !trimmed.includes('<')) {
+    const parsed = tryParse(trimmed);
+    if (parsed.ok) return false;
+  }
+  const tokens = scanDslTags(source);
+  const stack = [];
+  for (const token of tokens) {
+    // Only a clean, balanced parameter pair is valid literal value content.
+    // A garbled tag name inside a value means markup was swallowed, not echoed.
+    if (token.garbled || token.kind !== 'parameter') return true;
+    if (token.selfClosing) continue;
+    if (!token.closing) stack.push(token.kind);
+    else if (!stack.length) return true;
+    else stack.pop();
+  }
+  if (stack.length) return true;
+  if (!tokens.length) return MARKER_FRAGMENT_RES.some((re) => re.test(source));
+  const leftover = removeSpans(
+    source,
+    tokens.map((token) => [token.start, token.end]),
+  );
+  return MARKER_FRAGMENT_RES.some((re) => re.test(leftover));
 }
 
 function typedParamValue(param, propertySchema) {
@@ -592,12 +701,40 @@ function parseInvokeBody(name, body, context, schema) {
 function buildDslCalls(invokes, context) {
   const calls = [];
   const invalid = [];
+  let emptyMentions = 0;
 
   for (const invoke of invokes) {
-    const name = invoke.name;
-    if (!name) {
-      invalid.push({ name: null, reason: 'missing_name' });
+    let name = invoke.name;
+    const named = invoke.params.filter((param) => param.name);
+
+    // A parameter whose name could not be recovered means the block is
+    // malformed. Falling back to the generic invoke-body parser here would
+    // turn swallowed markup into an argument key (e.g. "DSMLparameter") and
+    // execute protocol garbage.
+    if (!named.length && invoke.params.length) {
+      invalid.push({ name: name || null, reason: 'missing_name' });
       continue;
+    }
+
+    // A bare <invoke> with no name and no parameters is a prose mention (the
+    // model explaining the protocol), not a failed call. Do not fire repair for
+    // it; the markup is still stripped from the visible content.
+    if (!name && !named.length) {
+      emptyMentions += 1;
+      continue;
+    }
+
+    // The model forgot the <invoke> wrapper (or its name): infer the tool from
+    // the argument names, but only when exactly one schema fits. Ambiguity is
+    // a failed call, never a guess.
+    if (!name) {
+      const provisional = {};
+      for (const param of named) provisional[param.name] = param.raw;
+      name = inferToolName(provisional, context.tools, context.preferredName);
+      if (!name) {
+        invalid.push({ name: null, reason: 'missing_name' });
+        continue;
+      }
     }
 
     // A parameter is only complete when its own closing tag was found. 'eof'
@@ -614,7 +751,12 @@ function buildDslCalls(invokes, context) {
       continue;
     }
 
-    const named = invoke.params.filter((param) => param.name);
+    const brokenParam = named.some((param) => hasBrokenDsmlMarkup(param.raw));
+    if (brokenParam) {
+      invalid.push({ name, reason: 'dsml_in_value' });
+      continue;
+    }
+
     // Resolve the tool with the raw parameters so a renamed tool ("execute_bash"
     // -> "bash") still gets its real schema for typing the values.
     const provisional = {};
@@ -631,7 +773,7 @@ function buildDslCalls(invokes, context) {
     calls.push(...groupDslParams(name, named, schema));
   }
 
-  return { calls, invalid };
+  return { calls, invalid, emptyMentions };
 }
 
 function codeRegions(text) {
@@ -644,46 +786,36 @@ function codeRegions(text) {
   return regions;
 }
 
-function tokensInsideCode(text, tokens) {
-  if (!tokens.length) return false;
-  const regions = codeRegions(text);
-  return tokens.every((tk) =>
-    regions.some(([a, b]) => tk.start >= a && tk.end <= b),
-  );
-}
-
 function parseDslBlocks(text, context) {
-  let tokens = scanDslTags(text);
-  let style = 'prefixed';
-  if (!tokens.some((token) => token.kind === 'invoke' || token.kind === 'calls')) {
-    // Unprefixed <function_calls><invoke name="..."> (Claude-style markup). The
-    // prefixed scanner already accepts a bare <invoke>; this second pass exists
-    // for the bare <function_calls> wrapper, so require a real invoke name.
-    tokens = scanDslTags(text);
-    style = 'bare';
-    if (!tokens.some((token) => token.kind === 'invoke' && !token.closing && /\bname\s*=/i.test(token.attrs))) {
-      return { calls: [], invalid: [], spans: [], markers: false, fenced: false };
-    }
+  const allTokens = scanDslTags(text);
+  if (!allTokens.length) return { calls: [], invalid: [], spans: [], markers: false, fenced: false };
+
+  // Markup inside a code fence or inline backticks is a written example, never
+  // an instruction. Ignore those tokens; real calls elsewhere in the reply are
+  // still parsed.
+  const regions = codeRegions(text);
+  const tokens = allTokens.filter(
+    (token) => !regions.some(([start, end]) => token.start >= start && token.end <= end),
+  );
+  if (!tokens.length) {
+    return { calls: [], invalid: [], spans: [], markers: true, fenced: true, prose: false };
   }
-  if (!tokens.length) return { calls: [], invalid: [], spans: [], markers: false, fenced: false };
 
   const walked = walkDslTokens(text, tokens);
 
-  // Bare markup is ambiguous (could be prose about XML), so require a real tool.
-  if (style === 'bare') {
-    const known = walked.invokes.some(
-      (invoke) => invoke.name && context.lookupTool && context.lookupTool(invoke.name),
-    );
-    if (!known) return { calls: [], invalid: [], spans: [], markers: false, fenced: false };
-  }
-
   const built = buildDslCalls(walked.invokes, context);
+  const prose =
+    built.emptyMentions > 0 &&
+    built.calls.length === 0 &&
+    built.invalid.length === 0 &&
+    walked.invokes.every((invoke) => !invoke.name && !invoke.params.length);
   return {
     calls: built.calls,
     invalid: built.invalid,
     spans: walked.spans,
     markers: true,
-    fenced: tokensInsideCode(text, tokens),
+    fenced: false,
+    prose,
   };
 }
 
@@ -701,7 +833,7 @@ export function extractDsml(text, context = {}) {
   // failed call, not prose. Strip the markup and let repair fire. Markup
   // inside a fence or backticks is a written example and stays verbatim.
   if (!parsed.calls.length && !parsed.invalid.length) {
-    if (parsed.markers && !parsed.fenced) {
+    if (parsed.markers && !parsed.fenced && !parsed.prose) {
       return {
         calls: [],
         content: cleanupDsmlContent(text, parsed.spans),

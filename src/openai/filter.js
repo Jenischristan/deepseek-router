@@ -19,10 +19,15 @@ import { stripLeadingThink } from './parse.js';
 // has seen any of it).
 // ===========================================================================
 
+const GAP = String.raw`[\s\u200B-\u200D]*`;
+
 const TOOL_START_RE = new RegExp(
   [
     String.raw`<(?:tool_calls?|function_calls?|tool_uses?)(?![A-Za-z0-9_])`,
-    String.raw`<\/?\s*(?:[｜|]\s*){0,3}DSML(?![A-Za-z0-9_])`,
+    // Match as soon as the marker name is complete. The parser accepts the
+    // tag name with no separator (`<DSMLcalls>`), so waiting for a boundary
+    // here would let chunked delivery leak the tag.
+    String.raw`<\/?${GAP}(?:[｜|]${GAP}){0,3}DSML`,
     String.raw`<invoke\s+name\s*=`,
     String.raw`<\s*[｜|]\s*tool[▁_ ]calls?[▁_ ]begin`,
     String.raw`<\s*[｜|]\s*tool[▁_ ]outputs?[▁_ ]begin`,
@@ -71,6 +76,13 @@ function trailingFenceOpen(text) {
   return /^```[A-Za-z0-9_+.-]*[ \t]*(?:\r?\n[ \t]*)?$/.test(tail) ? fence : -1;
 }
 
+// One or two trailing backticks may be the start of a fence split across
+// chunks; hold them until the next chunk (or takeHeld) settles it.
+function trailingFenceStart(text) {
+  const match = /`{1,2}$/.exec(text);
+  return match ? text.length - match[0].length : -1;
+}
+
 function isPartialToolStart(suffix) {
   if (!suffix || suffix[0] !== '<' || suffix.includes('>')) return false;
   const lower = suffix.toLowerCase();
@@ -80,7 +92,7 @@ function isPartialToolStart(suffix) {
   // letter after the bars is held: prose almost never writes "<｜" + letter.
   const piped = /^<\/?[ \t]*(?:[｜|][ \t]*)+([\s\S]*)$/.exec(lower);
   if (piped) {
-    const body = piped[1].replace(/[▁_\s｜|]/g, '');
+    const body = piped[1].replace(/[▁_\s｜|\u200B-\u200D]/g, '');
     return body === '' || PARTIAL_TOKEN_LITERALS.some((literal) => literal.startsWith(body));
   }
 
@@ -159,11 +171,19 @@ export class ToolCallStreamFilter {
     }
 
     // Do not stream a fence opener until we know whether the block it opens is
-    // a tool call. Otherwise "```xml\n<tool_call>" would leak the opener.
+    // a tool call. Otherwise "```xml\n<tool_call>" would leak the opener. The
+    // partial rule matters for chunked delivery: one backtick at a time must
+    // not be flushed before the fence can be recognised.
     const fence = trailingFenceOpen(this.buffer);
     if (fence !== -1) {
       const output = this.buffer.slice(0, fence);
       this.buffer = this.buffer.slice(fence);
+      return output;
+    }
+    const fenceStart = trailingFenceStart(this.buffer);
+    if (fenceStart !== -1) {
+      const output = this.buffer.slice(0, fenceStart);
+      this.buffer = this.buffer.slice(fenceStart);
       return output;
     }
 

@@ -39,7 +39,7 @@ export function sanitizeToolCalls(calls, tools) {
     args = unwrapArguments(args, schema);
     args = alignArguments(args, schema).args;
     args = coerceSchemaObject(args, schema);
-    let changed = JSON.stringify(args) !== call.argumentsText;
+    let changed = !isPlainObject(call.arguments) || JSON.stringify(args) !== call.argumentsText;
 
     if (properties?.command && !properties.workdir && !properties.cwd && !properties.directory) {
       for (const key of ['workdir', 'cwd', 'directory']) {

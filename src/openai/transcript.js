@@ -4,6 +4,9 @@ import { MAX_TOOL_RESULT_CHARS, looseJsonParse, messageContentText, stableString
 // ===========================================================================
 
 const DSML_BAR = '\uFF5C';
+// Attribute names are re-parsed by trimming and splitting on quotes/whitespace,
+// so only identifier-shaped keys survive the round trip verbatim.
+const ATTRIBUTE_KEY_RE = /^[A-Za-z_][\w:.-]*$/;
 
 function transcriptValue(value) {
   const text = typeof value === 'string' ? value : JSON.stringify(value);
@@ -38,12 +41,20 @@ export function formatToolCallsForTranscript(toolCalls) {
     lines.push(`<${DSML_BAR}DSML${DSML_BAR}invoke name="${call.name}">`);
     const args = call.arguments;
     if (args && typeof args === 'object' && !Array.isArray(args)) {
-      for (const [key, value] of Object.entries(args)) {
-        const encoded = transcriptValue(value);
-        lines.push(
-          `<${DSML_BAR}DSML${DSML_BAR}parameter name="${key}" string="${encoded.attribute}">` +
-            `${encoded.value}</${DSML_BAR}DSML${DSML_BAR}parameter>`,
-        );
+      const entries = Object.entries(args);
+      if (entries.every(([key]) => ATTRIBUTE_KEY_RE.test(key))) {
+        for (const [key, value] of entries) {
+          const encoded = transcriptValue(value);
+          lines.push(
+            `<${DSML_BAR}DSML${DSML_BAR}parameter name="${key}" string="${encoded.attribute}">` +
+              `${encoded.value}</${DSML_BAR}DSML${DSML_BAR}parameter>`,
+          );
+        }
+      } else {
+        // A JSON body preserves keys that cannot be represented as attributes
+        // (quotes, whitespace, non-identifier names). Escape `<` so a literal
+        // closing tag inside the JSON cannot terminate the invoke early.
+        lines.push(JSON.stringify(args).replace(/</g, '\\u003c'));
       }
     }
     lines.push(`</${DSML_BAR}DSML${DSML_BAR}invoke>`);
@@ -80,7 +91,9 @@ export function truncateMiddle(text, limit) {
 // re-parsed as a template on the next turn.
 export function escapeDsmlMarkers(text) {
   return String(text || '')
-    .replace(/([|｜][ \t]*)dsml/gi, '$1\u200bdsml')
+    // Insert the zero-width space inside the marker word: the parser tolerates
+    // zero-width characters around "DSML" and the bars, but not inside it.
+    .replace(/dsml/gi, (match) => `${match[0]}\u200b${match.slice(1)}`)
     .replace(/<([|｜])/g, '<\u200b$1')
     .replace(/<([ \t]*(?:invoke|tool_calls?|function_calls?|tool_uses?)\b)/gi, '<\u200b$1');
 }
