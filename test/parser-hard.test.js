@@ -550,11 +550,12 @@ test('dsml: prose mention is not a call and stays visible', () => {
   assert.match(result.content, /Use/);
 });
 
-test('dsml: an empty calls wrapper with no invoke is left untouched', () => {
+test('dsml: an empty calls wrapper with no invoke goes to repair', () => {
   const text = `<${BAR}DSML${BAR}calls></${BAR}DSML${BAR}calls>`;
-  const { calls, content } = extractDsml(text, { tools });
+  const { calls, content, invalid } = extractDsml(text, { tools });
   assert.equal(calls.length, 0);
-  assert.equal(content, text);
+  assert.equal(content, '');
+  assert.deepEqual(invalid, [{ name: null, reason: 'missing_name' }]);
 });
 
 test('dsml: literal nested parameter tags inside a value survive verbatim', () => {
@@ -562,6 +563,21 @@ test('dsml: literal nested parameter tags inside a value survive verbatim', () =
   const result = parseToolResponse(dsml('bash', [['command', `echo ${inner}`]]), tools);
   assert.equal(result.calls.length, 1);
   assert.equal(result.calls[0].arguments.command, `echo ${inner}`);
+});
+
+test('dsml: a closer named after a parameter is stripped from the value', () => {
+  const text = [
+    `<${BAR}DSML${BAR}calls>`,
+    `<${BAR}DSML${BAR}invoke name="bash">`,
+    `<${BAR}DSML${BAR}parameter name="command" string="true">ls -la</${BAR}DSML${BAR}timeout></${BAR}DSML${BAR}parameter>`,
+    `<${BAR}DSML${BAR}parameter name="timeout" string="false">5000</${BAR}DSML${BAR}parameter>`,
+    `</${BAR}DSML${BAR}invoke>`,
+  ].join('\n');
+  const result = parseToolResponse(text, tools);
+  assert.equal(result.calls.length, 1);
+  assert.deepEqual(result.calls[0].arguments, { command: 'ls -la', timeout: 5000 });
+  assert.doesNotMatch(result.calls[0].argumentsText, /DSML/);
+  assert.doesNotMatch(result.content, /DSML/);
 });
 
 test('dsml: string="false" numbers are parsed, not stringified', () => {

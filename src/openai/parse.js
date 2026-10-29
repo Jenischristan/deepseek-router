@@ -8,15 +8,22 @@ import { formatToolSignatures } from './prompt.js';
 // ===========================================================================
 
 export function stripLeadingThink(text) {
+  return splitLeadingThink(text).rest;
+}
+
+// Leading <think>…</think> blocks are model reasoning, not assistant content.
+// An unclosed block means the reply was cut mid-reasoning: keep the text (it
+// may hold the real answer) but let the caller treat it as reasoning.
+function splitLeadingThink(text) {
   let source = String(text || '');
+  let hadThink = false;
   for (;;) {
     const open = /^\s*<think(?:ing)?\b[^>]*>/i.exec(source);
-    if (!open) return source;
+    if (!open) return { rest: source, hadThink, closed: true };
+    hadThink = true;
     const rest = source.slice(open[0].length);
     const close = /<\/think(?:ing)?\s*>/i.exec(rest);
-    // An unclosed think block is a truncated reply, not a reason to discard
-    // everything the model produced. Drop the opening marker and keep the text.
-    if (!close) return rest;
+    if (!close) return { rest, hadThink, closed: false };
     source = rest.slice(close.index + close[0].length);
   }
 }
@@ -116,11 +123,12 @@ export function parseToolResponse(text, tools = [], options = {}) {
     tools: toolList,
     preferredName: options.preferredName || null,
     truncated: Boolean(options.truncated),
-    // Strict lookup first; with the raw arguments also allow synonym/typo matches
-    // so the right schema is used to type the values.
-    lookupTool: (name, args) => {
-      let resolved = resolveToolName(name, index, { strict: true });
-      if (!resolved.name && args) resolved = resolveToolName(name, index, { args, strict: false });
+    // Strict resolution only: synonyms and typos become suggestions routed
+    // through repair, never an automatic rename of a tool the model did not
+    // choose. (The raw arguments are still used by extractCalls to pick the
+    // right schema when the tool name is missing entirely.)
+    lookupTool: (name) => {
+      const resolved = resolveToolName(name, index);
       return resolved.name ? index.byName.get(resolved.name) || null : null;
     },
   };
@@ -128,16 +136,14 @@ export function parseToolResponse(text, tools = [], options = {}) {
   const source = typeof text === 'string' ? text : '';
   if (!source.trim()) return { calls: [], content: source.trim(), invalidCalls: [] };
 
-  let content = stripLeadingThink(source);
+  const think = splitLeadingThink(source);
+  let content = think.rest;
   const calls = [];
   const invalidCalls = [];
 
-  const addCall = (call, { strictNames = false } = {}) => {
+  const addCall = (call) => {
     if (restricted) {
-      const resolved = resolveToolName(call.name, index, {
-        args: call.arguments,
-        strict: strictNames,
-      });
+      const resolved = resolveToolName(call.name, index);
       if (!resolved.name) {
         const entry = { name: call.name, reason: 'unknown_tool' };
         if (resolved.suggestions?.length) entry.suggestions = resolved.suggestions;
@@ -175,11 +181,9 @@ export function parseToolResponse(text, tools = [], options = {}) {
     if (!restricted) return false;
     const extracted = extractCalls(payload, { ...context, allowInference: false });
     if (!extracted.length) return false;
-    const allKnown = extracted.every(
-      (call) => resolveToolName(call.name, index, { strict: true }).name,
-    );
+    const allKnown = extracted.every((call) => resolveToolName(call.name, index).name);
     if (!allKnown) return false;
-    for (const call of extracted) addCall(call, { strictNames: true });
+    for (const call of extracted) addCall(call);
     return true;
   };
 
@@ -226,18 +230,22 @@ export function parseToolResponse(text, tools = [], options = {}) {
       const openEnd = openRe.lastIndex;
       const fenceStart = fenceBefore(input, match.index);
       const matchStart = fenceStart >= cursor ? fenceStart : match.index;
-      out += input.slice(cursor, matchStart);
 
       const firstCloser = findCloser(input, wrapper, openEnd);
       const bodyPreview = input.slice(openEnd, firstCloser ? firstCloser.start : input.length);
 
       if (looksLikeDsml(bodyPreview)) {
-        // Drop only the wrapper; the DSML pass owns the body.
-        out += bodyPreview;
+        // Drop only the wrapper tags; the DSML pass owns the body. Any opening
+        // fence stays so that a fenced example is recognised as written code
+        // (and its empty fence pair cleaned up afterwards) instead of being
+        // executed or left behind as debris.
+        out += input.slice(cursor, match.index) + bodyPreview;
         cursor = firstCloser ? firstCloser.end : input.length;
         openRe.lastIndex = cursor;
         continue;
       }
+
+      out += input.slice(cursor, matchStart);
 
       const scanned = scanPayloads(input, openEnd);
       let closer = null;
@@ -274,13 +282,15 @@ export function parseToolResponse(text, tools = [], options = {}) {
         continue;
       }
 
-      // "<tool_call>" merely mentioned in prose: no JSON follows and the tag is
-      // never closed (or what it wraps is clearly not an attempted call).
+      // A tool tag merely mentioned in prose: never closed on a finished
+      // reply, or wrapping something that is clearly not an attempted call.
+      // Long mentions stay prose too — swallowing the rest of the reply and
+      // firing a repair round would be worse than keeping the text.
+      const looksLikePayload = /[{["=:<`]/.test(trimmedBody);
       const proseMention =
-        !hasCloser &&
-        !context.truncated &&
-        trimmedBody.length < 80 &&
-        !/[{["=:<`]/.test(trimmedBody);
+        Boolean(trimmedBody) &&
+        ((!hasCloser && !context.truncated && !looksLikePayload) ||
+          (trimmedBody.length < 80 && !looksLikePayload));
       if (proseMention) {
         cursor = matchStart;
         continue;
@@ -337,7 +347,22 @@ export function parseToolResponse(text, tools = [], options = {}) {
     }
   }
 
-  content = content.replace(/```[A-Za-z0-9_+.-]*[ \t]*\r?\n?[ \t]*```/gi, '').trim();
+  // Empty-fence debris left behind after a fenced tool block was removed:
+  // "```xml\n\n```". A bare "```\n```" (a closing fence directly followed by
+  // the next opening fence) is NOT debris — removing it would glue two real
+  // blocks together — so the newline form requires a language tag.
+  content = content
+    .replace(/```[A-Za-z0-9_+.-]*[ \t]*```/gi, '')
+    .replace(/```[A-Za-z0-9_+.-]+[ \t]*\r?\n[ \t\r\n]*```/gi, '')
+    .trim();
+
+  // A leading think block that never closed is reasoning, not content: keep
+  // the text (the real answer may be in it) but never execute tool calls that
+  // appear inside it — they are model-internal, exactly like the closed case.
+  if (think.hadThink && !think.closed) {
+    return { calls: [], content, invalidCalls: [] };
+  }
+
   return { calls, content, invalidCalls };
 }
 
@@ -406,6 +431,11 @@ export function describeInvalidCall(item) {
     return 'a <tool_call> block did not contain valid JSON (escape newlines as \\n and quotes as \\" inside strings).';
   case 'invalid_arguments':
     return `the arguments for ${quoted} were not a valid JSON object.`;
+  case 'dsml_in_value':
+    return (
+      `the arguments for ${quoted} still contained raw tool-call markup (a DSML tag). ` +
+      'Rewrite the values as plain text without any <…DSML…> tags.'
+    );
   case 'missing_name':
     return 'a tool call had no tool name.';
   case 'unterminated_parameter':
@@ -464,11 +494,11 @@ export function buildToolRepairPrompt(interpretation, tools, { toolChoice = 'aut
   lines.push(
     '',
     'Reply again with ONLY the corrected tool block. Include ALL the tool calls you intended, not just the failed ones, in DeepSeek DSML markup:',
-    '<\uFF5CDSML\uFF5Ccalls>',
+    '<\uFF5CDSML\uFF5Cfunction_calls>',
     '<\uFF5CDSML\uFF5Cinvoke name="<exact tool name>">',
     '<\uFF5CDSML\uFF5Cparameter name="<exact parameter name>" string="true">value</\uFF5CDSML\uFF5Cparameter>',
     '</\uFF5CDSML\uFF5Cinvoke>',
-    '</\uFF5CDSML\uFF5Ccalls>',
+    '</\uFF5CDSML\uFF5Cfunction_calls>',
     'Use string="false" for non-string values (JSON value). The JSON form <tool_call>{"calls":[...]}</tool_call> is also accepted as a fallback.',
     'Tool names and parameter names are case-sensitive.',
   );

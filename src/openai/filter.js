@@ -76,19 +76,33 @@ function isPartialToolStart(suffix) {
   const lower = suffix.toLowerCase();
   if (lower === '<' || lower === '</' || lower.trim() === '</') return true;
 
-  // "<｜", "<｜DS", "<｜tool▁ca", "</｜DSML calls" ...
-  const piped = /^<\/?\s*[｜|]\s*([\s\S]*)$/.exec(lower);
+  // "<｜", "<｜DS", "</｜DSML calls" ... — bar-prefixed markers. Even a single
+  // letter after the bars is held: prose almost never writes "<｜" + letter.
+  const piped = /^<\/?[ \t]*(?:[｜|][ \t]*)+([\s\S]*)$/.exec(lower);
   if (piped) {
     const body = piped[1].replace(/[▁_\s｜|]/g, '');
     return body === '' || PARTIAL_TOKEN_LITERALS.some((literal) => literal.startsWith(body));
   }
 
-  // "<tool_", "<function_c", "</tool_call" ...
-  const plain = lower.replace(/^<\s*\/?\s*/, '');
+  // "<DSM", "<DSML" — the same marker with the bar dropped.
+  if (/^<\/?[ \t]*d(?:s(?:m(?:l)?)?)?$/.test(lower)) return true;
+
+  // "</tool_call", "<tool_", "<function_c". A bare "<" never strips the
+  // following whitespace: "< t" / "< f" / "< i" are ordinary prose, and
+  // holding them would silently drop the text when the reply ends there.
+  const plain = lower.startsWith('</')
+    ? lower.slice(2).replace(/^[ \t]+/, '')
+    : lower.slice(1);
   if (!plain) return true;
-  const compact = plain.replace(/\s+/g, '');
+  if (plain[0] === ' ' || plain[0] === '\t') return false;
   if (TOOL_START_LITERALS.some((literal) => literal.slice(1).startsWith(plain))) return true;
-  if (TOOL_START_LITERALS.some((literal) => literal.slice(1).startsWith(compact))) return true;
+  const compact = plain.replace(/\s+/g, '');
+  if (
+    compact.length >= 2 &&
+    TOOL_START_LITERALS.some((literal) => literal.slice(1).startsWith(compact))
+  ) {
+    return true;
+  }
   return PARTIAL_INVOKE_RE.test(lower);
 }
 

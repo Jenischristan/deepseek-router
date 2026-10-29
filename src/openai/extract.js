@@ -214,6 +214,9 @@ export function extractCalls(payload, context = {}) {
 
 const DSML_NAMES = 'tool_calls|function_calls|calls|invoke|parameter';
 const DSML_PREFIX = String.raw`\s*(?:[｜|]\s*){0,3}DSML\s*(?:[｜|]\s*){0,3}`;
+// A name-agnostic prefix for cleanup: any DSML marker, any following tag name.
+const DSML_PREFIX_ANY = String.raw`\s*(?:[｜|]\s*){0,3}DSML\s*(?:[｜|]\s*){0,3}`;
+
 // `ATTRS_SRC` stops at a `>` only when it is not inside a quoted value. Models
 // routinely put `</｜DSML｜parameter>` or `>` inside a parameter value; the old
 // `[^>]*` ended the tag there and split the call in half.
@@ -223,7 +226,7 @@ const OPEN_TAG_RE = new RegExp(
   'gi',
 );
 const DSML_ANY_TAG_RE = new RegExp(
-  String.raw`<\/?${DSML_PREFIX}(?:${DSML_NAMES})(?![A-Za-z0-9_])${ATTRS_SRC}>`,
+  String.raw`<\/?` + DSML_PREFIX_ANY + String.raw`[^>]*>`,
   'gi',
 );
 const DSML_PARTIAL_TAIL_RE = new RegExp(
@@ -441,9 +444,20 @@ function lookupPropertySchema(schema, key) {
 
 // Without a schema (tool not resolved yet) the value stays a string: the real
 // type coercion happens in sanitizeToolCalls once the final tool is known.
+const DSML_UNKNOWN_CLOSER_RE = new RegExp(
+  String.raw`<\/` + DSML_PREFIX + String.raw`([A-Za-z_][\w:.-]*)` + ATTRS_SRC + String.raw`>`,
+  'gi',
+);
+function stripUnknownClosers(text) {
+  const known = new Set(DSML_NAMES.split('|'));
+  return text.replace(DSML_UNKNOWN_CLOSER_RE, (m, name) =>
+    known.has(String(name).toLowerCase()) ? m : '',
+  );
+}
+
 function typedParamValue(param, propertySchema) {
   const attr = param.stringAttr == null ? null : String(param.stringAttr).toLowerCase();
-  const raw = param.raw;
+  const raw = stripUnknownClosers(param.raw);
   if (attr === 'true') return raw;
 
   const types = schemaTypes(propertySchema);
@@ -620,6 +634,24 @@ function buildDslCalls(invokes, context) {
   return { calls, invalid };
 }
 
+function codeRegions(text) {
+  const regions = [];
+  const fenceRe = /```[\s\S]*?```/g;
+  let m;
+  while ((m = fenceRe.exec(text)) !== null) regions.push([m.index, m.index + m[0].length]);
+  const inlineRe = /`[^`\n]+`/g;
+  while ((m = inlineRe.exec(text)) !== null) regions.push([m.index, m.index + m[0].length]);
+  return regions;
+}
+
+function tokensInsideCode(text, tokens) {
+  if (!tokens.length) return false;
+  const regions = codeRegions(text);
+  return tokens.every((tk) =>
+    regions.some(([a, b]) => tk.start >= a && tk.end <= b),
+  );
+}
+
 function parseDslBlocks(text, context) {
   let tokens = scanDslTags(text);
   let style = 'prefixed';
@@ -630,10 +662,10 @@ function parseDslBlocks(text, context) {
     tokens = scanDslTags(text);
     style = 'bare';
     if (!tokens.some((token) => token.kind === 'invoke' && !token.closing && /\bname\s*=/i.test(token.attrs))) {
-      return { calls: [], invalid: [], spans: [] };
+      return { calls: [], invalid: [], spans: [], markers: false, fenced: false };
     }
   }
-  if (!tokens.length) return { calls: [], invalid: [], spans: [] };
+  if (!tokens.length) return { calls: [], invalid: [], spans: [], markers: false, fenced: false };
 
   const walked = walkDslTokens(text, tokens);
 
@@ -642,31 +674,52 @@ function parseDslBlocks(text, context) {
     const known = walked.invokes.some(
       (invoke) => invoke.name && context.lookupTool && context.lookupTool(invoke.name),
     );
-    if (!known) return { calls: [], invalid: [], spans: [] };
+    if (!known) return { calls: [], invalid: [], spans: [], markers: false, fenced: false };
   }
 
   const built = buildDslCalls(walked.invokes, context);
-  return { calls: built.calls, invalid: built.invalid, spans: walked.spans };
+  return {
+    calls: built.calls,
+    invalid: built.invalid,
+    spans: walked.spans,
+    markers: true,
+    fenced: tokensInsideCode(text, tokens),
+  };
+}
+
+function cleanupDsmlContent(text, spans) {
+  let content = spans.length ? removeSpans(text, spans) : text;
+  content = content.replace(DSML_ANY_TAG_RE, '');
+  content = content.replace(DSML_PARTIAL_TAIL_RE, '');
+  content = content.replace(/<tool_call\b[^>]*$/i, '').trim();
+  return content;
 }
 
 export function extractDsml(text, context = {}) {
   const parsed = parseDslBlocks(text, context);
-  // With no parsed call and no failed attempt, DSML-looking text is prose (a
-  // model explaining the protocol, an example in a code block). Keep it
-  // verbatim, even if an empty calls wrapper was seen; only remove a marker
-  // that was cut off at the end of the reply.
+  // A DSML marker was seen but nothing parseable came out of it: that is a
+  // failed call, not prose. Strip the markup and let repair fire. Markup
+  // inside a fence or backticks is a written example and stays verbatim.
   if (!parsed.calls.length && !parsed.invalid.length) {
+    if (parsed.markers && !parsed.fenced) {
+      return {
+        calls: [],
+        content: cleanupDsmlContent(text, parsed.spans),
+        invalid: [{ name: null, reason: 'missing_name' }],
+      };
+    }
+    if (parsed.fenced) return { calls: [], content: text.trim(), invalid: [] };
     const content = text
       .replace(DSML_PARTIAL_TAIL_RE, '')
       .replace(/<tool_call\b[^>]*$/i, '')
       .trim();
     return { calls: [], content, invalid: [] };
   }
-  let content = parsed.spans.length ? removeSpans(text, parsed.spans) : text;
-  content = content.replace(DSML_ANY_TAG_RE, '');
-  content = content.replace(DSML_PARTIAL_TAIL_RE, '');
-  content = content.replace(/<tool_call\b[^>]*$/i, '').trim();
-  return { calls: parsed.calls, content, invalid: parsed.invalid };
+  return {
+    calls: parsed.calls,
+    content: cleanupDsmlContent(text, parsed.spans),
+    invalid: parsed.invalid,
+  };
 }
 
 // ---------------------------------------------------------------------------

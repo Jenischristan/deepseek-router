@@ -418,18 +418,20 @@ test('supports multiple invokes in one calls block', () => {
   );
 });
 
-test('keeps DSML-looking prose but strips a cut-off trailing marker', () => {
+test('a DSML marker mentioned in prose goes to repair, not execution', () => {
   const text = `hello </${BAR}DSML${BAR} calls> world <${BAR}DSML${BAR} invoke`;
   const result = parse(text);
   assert.equal(result.calls.length, 0);
-  assert.equal(result.content, `hello </${BAR}DSML${BAR} calls> world`);
+  assert.equal(result.content, 'hello  world');
+  assert.deepEqual(result.invalidCalls, [{ name: null, reason: 'missing_name' }]);
 });
 
-test('keeps an empty DSML wrapper mentioned in prose', () => {
+test('an empty DSML wrapper mentioned in prose goes to repair', () => {
   const text = `Wrap calls in <${BAR}DSML${BAR} calls> tags.`;
   const result = parse(text);
   assert.equal(result.calls.length, 0);
-  assert.equal(result.content, text);
+  assert.equal(result.content, 'Wrap calls in  tags.');
+  assert.deepEqual(result.invalidCalls, [{ name: null, reason: 'missing_name' }]);
 });
 
 test('drops a cut-off tool marker at the end of a stream', () => {

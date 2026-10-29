@@ -66,11 +66,11 @@ function exampleCall(tools, preferredName) {
     return dsmlParameter(key, value, stringType);
   });
   return [
-    `<${DSML_BAR}DSML${DSML_BAR}calls>`,
+    `<${DSML_BAR}DSML${DSML_BAR}function_calls>`,
     `<${DSML_BAR}DSML${DSML_BAR}invoke name="${tool.name}">`,
     ...params,
     `</${DSML_BAR}DSML${DSML_BAR}invoke>`,
-    `</${DSML_BAR}DSML${DSML_BAR}calls>`,
+    `</${DSML_BAR}DSML${DSML_BAR}function_calls>`,
   ].join('\n');
 }
 
@@ -172,9 +172,9 @@ export function formatToolReminder(tools) {
   return (
     `[Tool reminder] Available tools: ${body}. ` +
     'To call tools reply with DeepSeek DSML markup: ' +
-    `<${DSML_BAR}DSML${DSML_BAR}calls><${DSML_BAR}DSML${DSML_BAR}invoke name="<exact tool name>">` +
+    `<${DSML_BAR}DSML${DSML_BAR}function_calls><${DSML_BAR}DSML${DSML_BAR}invoke name="<exact tool name>">` +
     `<${DSML_BAR}DSML${DSML_BAR}parameter name="<exact parameter name>" string="true">value</${DSML_BAR}DSML${DSML_BAR}parameter>` +
-    `</${DSML_BAR}DSML${DSML_BAR}invoke></${DSML_BAR}DSML${DSML_BAR}calls> ` +
+    `</${DSML_BAR}DSML${DSML_BAR}invoke></${DSML_BAR}DSML${DSML_BAR}function_calls> ` +
     'and nothing after it. Tool and parameter names are case-sensitive: use them exactly as listed (a "?" marks an optional parameter). ' +
     'Never call a tool that is not in this list.'
   );
@@ -190,11 +190,11 @@ export function buildToolInstructions(tools, { toolChoice = 'auto', parallelTool
   const lines = [
     '[Tool use protocol]',
     'You can call tools. DeepSeek DSML markup is the preferred format. To call one or more tools, reply with exactly this structure and put nothing after it:',
-    `<${DSML_BAR}DSML${DSML_BAR}calls>`,
+    `<${DSML_BAR}DSML${DSML_BAR}function_calls>`,
     `<${DSML_BAR}DSML${DSML_BAR}invoke name="TOOL_NAME">`,
     `<${DSML_BAR}DSML${DSML_BAR}parameter name="PARAMETER_NAME" string="true">value</${DSML_BAR}DSML${DSML_BAR}parameter>`,
     `</${DSML_BAR}DSML${DSML_BAR}invoke>`,
-    `</${DSML_BAR}DSML${DSML_BAR}calls>`,
+    `</${DSML_BAR}DSML${DSML_BAR}function_calls>`,
     `Format example (tool and values are placeholders, choose whichever listed tool fits the task): ${exampleCall(
       tools,
       choice.mode === 'function' ? choice.name : null,

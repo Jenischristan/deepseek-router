@@ -74,6 +74,22 @@ export function truncateMiddle(text, limit) {
   return `${text.slice(0, head)}\n...[truncated ${dropped} chars]...\n${text.slice(text.length - tail)}`;
 }
 
+// Echoing raw tool markup in results teaches the model to copy it — including
+// the mangled forms it produced. Neutralise the marker characters (an invisible
+// zero-width space keeps the text readable) so pasted garbage can never be
+// re-parsed as a template on the next turn.
+export function escapeDsmlMarkers(text) {
+  return String(text || '')
+    .replace(/([|｜][ \t]*)dsml/gi, '$1\u200bdsml')
+    .replace(/<([|｜])/g, '<\u200b$1')
+    .replace(/<([ \t]*(?:invoke|tool_calls?|function_calls?|tool_uses?)\b)/gi, '<\u200b$1');
+}
+
+// Arguments are echoed only as a short reminder of what was called: the full
+// echo duplicates large payloads (file contents) every turn and widens the
+// feedback loop that makes the model copy its own garbage.
+const MAX_ARGUMENT_ECHO_CHARS = 2000;
+
 export function formatToolResultBlock(message, mapping = {}, { maxChars = MAX_TOOL_RESULT_CHARS } = {}) {
   const id = message.tool_call_id || message.id || '';
   // A name is only enough when it identifies exactly one call: with parallel
@@ -84,8 +100,14 @@ export function formatToolResultBlock(message, mapping = {}, { maxChars = MAX_TO
   const byName = named.length === 1 ? named[0] : null;
   const known = mapping[id] || byName || {};
   const name = known.name || message.name || 'tool';
-  const args = known.argumentsText || '{}';
-  const result = truncateMiddle(messageContentText(message.content).trim() || '(empty result)', maxChars);
+  const args = truncateMiddle(
+    escapeDsmlMarkers(known.argumentsText || '{}'),
+    MAX_ARGUMENT_ECHO_CHARS,
+  );
+  const result = truncateMiddle(
+    escapeDsmlMarkers(messageContentText(message.content).trim() || '(empty result)'),
+    maxChars,
+  );
   return `[Tool result]\ncall_id: ${id || '(unknown)'}\ntool: ${name}\narguments: ${args}\nresult:\n${result}\n[End of tool result]`;
 }
 
