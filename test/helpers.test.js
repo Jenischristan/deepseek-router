@@ -38,6 +38,8 @@ const ENV_KEYS = [
   'UPSTREAM_CONCURRENCY',
   'DEEPSEEK_REQUEST_DELAY_SECONDS',
   'REQUEST_DELAY_SECONDS',
+  'DEEPSEEK_TOOL_RESULT_DELAY_SECONDS',
+  'DEEPSEEK_TOOL_RESULT_SKIP_AFTER_SECONDS',
   'SESSION_TTL_MS',
   'MAX_SESSIONS',
   'INJECT_TOOL_PROMPT',
@@ -141,6 +143,8 @@ test('loadConfig defaults browser fingerprint settings', () => {
     assert.equal(cfg.secGpc, true);
     assert.equal(cfg.hifDliqRefresh, false);
     assert.equal(cfg.requestDelaySeconds, null);
+    assert.equal(cfg.toolResultDelaySeconds, null);
+    assert.equal(cfg.toolResultSkipAfterSeconds, 8);
     assert.equal(cfg.transport, 'firefox');
     assert.match(cfg.transportBinary, /transport\/deepseek-transport$/);
     assert.equal(cfg.transportProfile, 'firefox_159');
@@ -189,6 +193,88 @@ test('TokenStore hot-reloads requestDelaySeconds', () => {
   } finally {
     fs.unlinkSync(file);
   }
+});
+
+test('loadConfig reads tool result cooldown from the file and env', () => {
+  const file = path.join(os.tmpdir(), `deepseek-router-cooldown-${process.pid}.json`);
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      token: 'a',
+      toolResultDelaySeconds: 4,
+      toolResultSkipAfterSeconds: 8,
+    }),
+  );
+  try {
+    withEnv({ DEEPSEEK_ROUTER_CONFIG_FILE: file }, () => {
+      const cfg = loadConfig();
+      assert.equal(cfg.toolResultDelaySeconds, 4);
+      assert.equal(cfg.toolResultSkipAfterSeconds, 8);
+    });
+    withEnv(
+      {
+        DEEPSEEK_ROUTER_CONFIG_FILE: file,
+        DEEPSEEK_TOOL_RESULT_DELAY_SECONDS: '0',
+        DEEPSEEK_TOOL_RESULT_SKIP_AFTER_SECONDS: '3',
+      },
+      () => {
+        const cfg = loadConfig();
+        assert.equal(cfg.toolResultDelaySeconds, 0);
+        assert.equal(cfg.toolResultSkipAfterSeconds, 3);
+      },
+    );
+  } finally {
+    fs.unlinkSync(file);
+  }
+});
+
+test('TokenStore hot-reloads tool result cooldown', () => {
+  const file = path.join(os.tmpdir(), `deepseek-router-cooldown-store-${process.pid}.json`);
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      token: 'a',
+      toolResultDelaySeconds: 4,
+      toolResultSkipAfterSeconds: 8,
+    }),
+  );
+  try {
+    const store = new TokenStore({
+      token: 'a',
+      toolResultDelaySeconds: 4,
+      toolResultSkipAfterSeconds: 8,
+      configFile: file,
+    });
+    assert.equal(store.toolResultDelayMs(), 4000);
+    assert.equal(store.toolResultSkipAfterMs(), 8000);
+
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        token: 'a',
+        toolResultDelaySeconds: 0,
+        toolResultSkipAfterSeconds: 3,
+      }),
+    );
+    let stamp = new Date(Date.now() + 1000);
+    fs.utimesSync(file, stamp, stamp);
+    assert.equal(store.toolResultDelayMs(), 0);
+    assert.equal(store.toolResultSkipAfterMs(), 3000);
+
+    fs.writeFileSync(file, JSON.stringify({ token: 'a' }));
+    stamp = new Date(Date.now() + 2000);
+    fs.utimesSync(file, stamp, stamp);
+    assert.equal(store.toolResultDelayMs(), 0);
+    assert.equal(store.toolResultSkipAfterMs(), 8000);
+  } finally {
+    fs.unlinkSync(file);
+  }
+});
+
+test('TokenStore disables tool result cooldown when unset', () => {
+  const store = new TokenStore({ token: 'a', configFile: null });
+  assert.equal(store.toolResultDelayMs(), 0);
+  assert.equal(store.toolResultSkipAfterMs(), 8000);
 });
 
 test('loadConfig reads pacing and rotation settings from the config file', () => {

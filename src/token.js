@@ -32,6 +32,8 @@ export class TokenStore {
     this.messagesOnAccount = 0;
     this.requestDelaySeconds = secondsValue(cfg.requestDelaySeconds);
     this.minIntervalMs = Math.max(0, Number(cfg.minIntervalMs) || 0);
+    this.toolResultDelaySeconds = secondsValue(cfg.toolResultDelaySeconds);
+    this.toolResultSkipAfterSeconds = secondsValue(cfg.toolResultSkipAfterSeconds) ?? 8;
     this.tokenFile = cfg.tokenFile || '';
     // `null` disables disk reloads, which tests use to stay hermetic. The
     // default keeps watching the user's config file.
@@ -48,6 +50,10 @@ export class TokenStore {
     this._envRequestDelay =
       process.env.DEEPSEEK_REQUEST_DELAY_SECONDS != null ||
       process.env.REQUEST_DELAY_SECONDS != null;
+    this._envToolResultDelay =
+      process.env.DEEPSEEK_TOOL_RESULT_DELAY_SECONDS != null;
+    this._envToolResultSkip =
+      process.env.DEEPSEEK_TOOL_RESULT_SKIP_AFTER_SECONDS != null;
     // token -> expiry timestamp (ms). Populated by markFailed().
     this._quarantine = new Map();
     // token -> expiry timestamp (ms) for interactive challenges. Tracked
@@ -161,6 +167,13 @@ export class TokenStore {
       if (!this._envRequestDelay) {
         this.requestDelaySeconds = secondsValue(cfg.requestDelaySeconds);
       }
+      if (!this._envToolResultDelay) {
+        this.toolResultDelaySeconds = secondsValue(cfg.toolResultDelaySeconds);
+      }
+      if (!this._envToolResultSkip) {
+        this.toolResultSkipAfterSeconds =
+          secondsValue(cfg.toolResultSkipAfterSeconds) ?? 8;
+      }
 
       if (this._envAccounts) return;
 
@@ -242,6 +255,18 @@ export class TokenStore {
       return Math.round(this.requestDelaySeconds * 1000);
     }
     return this.minIntervalMs;
+  }
+
+  toolResultDelayMs() {
+    this._readConfig();
+    if (this.toolResultDelaySeconds == null) return 0;
+    return Math.round(this.toolResultDelaySeconds * 1000);
+  }
+
+  toolResultSkipAfterMs() {
+    this._readConfig();
+    if (this.toolResultSkipAfterSeconds == null) return 8000;
+    return Math.round(this.toolResultSkipAfterSeconds * 1000);
   }
 
   async get() {

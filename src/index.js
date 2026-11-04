@@ -76,6 +76,15 @@ export async function runForeground() {
         : `${config.minIntervalMs}ms`
     }`,
   );
+  console.log(
+    `  tool cooldown: ${
+      config.toolResultDelaySeconds != null && config.toolResultDelaySeconds > 0
+        ? `${config.toolResultDelaySeconds}s (skip after ${
+          config.toolResultSkipAfterSeconds ?? 8
+        }s execution)`
+        : 'disabled'
+    }`,
+  );
 
   let closing = false;
   function shutdown(signal) {

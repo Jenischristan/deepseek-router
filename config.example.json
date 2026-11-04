@@ -10,6 +10,8 @@
   "port": 8788,
   "requestDelaySeconds": 4,
   "minIntervalMs": 400,
+  "toolResultDelaySeconds": 4,
+  "toolResultSkipAfterSeconds": 8,
   "concurrency": 1,
   "sessionTtlMs": 21600000,
   "maxSessions": 500,

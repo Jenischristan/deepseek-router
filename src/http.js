@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 
 import { saveConfig } from './config.js';
+import { ToolCooldown } from './cooldown.js';
 import { AuthError, ChallengeError, HttpError, UpstreamError } from './errors.js';
 import { SessionStore, conversationKey } from './sessions.js';
 import { MODELS, buildSeedPrompt, chunk, completionResponse, contentToText, dataUrlToBuffer, estimateTokens, extractImages, makeId, openaiError, resolveModel, usageChunk } from './openai/models.js';
@@ -20,15 +21,40 @@ const MAX_BODY_BYTES = 16 * 1024 * 1024;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function sleepWithSignal(ms, signal) {
+  if (!signal) return sleep(ms);
+  if (signal.aborted) {
+    return Promise.reject(new UpstreamError('Client closed request', { status: 499 }));
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new UpstreamError('Client closed request', { status: 499 }));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function secondsToMs(value, fallback = 0) {
+  const seconds = Number(value);
+  if (value != null && value !== '' && Number.isFinite(seconds) && seconds >= 0) {
+    return Math.round(seconds * 1000);
+  }
+  return fallback;
+}
+
 function configDelayMs(config) {
-  const seconds = Number(config.requestDelaySeconds);
   if (
     config.requestDelaySeconds != null &&
     config.requestDelaySeconds !== '' &&
-    Number.isFinite(seconds) &&
-    seconds >= 0
+    Number.isFinite(Number(config.requestDelaySeconds)) &&
+    Number(config.requestDelaySeconds) >= 0
   ) {
-    return Math.round(seconds * 1000);
+    return secondsToMs(config.requestDelaySeconds);
   }
   const interval = Number(config.minIntervalMs);
   return Number.isFinite(interval) && interval >= 0 ? interval : 0;
@@ -474,6 +500,29 @@ export function createServer({ config, tokenStore, client }) {
         ? () => tokenStore.requestDelayMs()
         : null,
   });
+  const toolCooldown = new ToolCooldown();
+  const toolCooldownDelayMs = () => {
+    if (typeof tokenStore.toolResultDelayMs === 'function') {
+      try {
+        const value = Number(tokenStore.toolResultDelayMs());
+        if (Number.isFinite(value) && value >= 0) return value;
+      } catch {
+        // Fall back to the startup config below.
+      }
+    }
+    return secondsToMs(config.toolResultDelaySeconds, 0);
+  };
+  const toolCooldownSkipAfterMs = () => {
+    if (typeof tokenStore.toolResultSkipAfterMs === 'function') {
+      try {
+        const value = Number(tokenStore.toolResultSkipAfterMs());
+        if (Number.isFinite(value) && value >= 0) return value;
+      } catch {
+        // Fall back to the startup config below.
+      }
+    }
+    return secondsToMs(config.toolResultSkipAfterSeconds, 8000);
+  };
 
   async function handleCompletion(req, res) {
     const startedAt = Date.now();
@@ -583,12 +632,27 @@ export function createServer({ config, tokenStore, client }) {
     };
     res.on('close', onClose);
 
+    const cooldownMs = turn?.toolMessages?.length
+      ? toolCooldown.delayFor({
+        assistant: turn.assistant,
+        toolMessages: turn.toolMessages,
+        delayMs: toolCooldownDelayMs(),
+        skipAfterMs: toolCooldownSkipAfterMs(),
+      })
+      : 0;
+
     let sessionId = null;
     let upstream = null;
     let usedAccount = null;
     let acquired = false;
 
     try {
+      if (cooldownMs > 0) {
+        log.debug(
+          `tool result cooldown: waiting ${cooldownMs}ms before the next upstream message`,
+        );
+        await sleepWithSignal(cooldownMs, controller.signal);
+      }
       await gate.acquire(controller.signal);
       acquired = true;
 
@@ -995,6 +1059,9 @@ export function createServer({ config, tokenStore, client }) {
             created,
           }),
         );
+        if (toolCalls.length && !controller.signal.aborted) {
+          toolCooldown.record(toolCalls);
+        }
 
         log.info(
           `POST /v1/chat/completions 200 ${Date.now() - startedAt}ms model=${model.id} stream=false` +
@@ -1169,6 +1236,9 @@ export function createServer({ config, tokenStore, client }) {
         res.write('data: [DONE]\n\n');
         res.end();
       }
+      if (toolCalls.length && !controller.signal.aborted) {
+        toolCooldown.record(toolCalls);
+      }
 
       log.info(
         `POST /v1/chat/completions 200 ${Date.now() - startedAt}ms model=${model.id} stream=true` +
@@ -1210,6 +1280,8 @@ export function createServer({ config, tokenStore, client }) {
         upstream: tokenStore.status(),
         sessions: sessions.size,
         requestDelaySeconds: gate.delayMs() / 1000,
+        toolResultDelaySeconds: toolCooldownDelayMs() / 1000,
+        toolResultSkipAfterSeconds: toolCooldownSkipAfterMs() / 1000,
         toolPrompt: config.injectToolPrompt !== false,
         toolParse: config.parseToolCalls !== false,
         toolRepair: config.repairToolCalls !== false ? clampInt(config.maxToolRepairs, 0, 5, 2) : 0,

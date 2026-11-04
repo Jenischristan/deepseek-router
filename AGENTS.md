@@ -33,6 +33,7 @@ single quotes, trailing commas, ESM imports.
 | `src/deepseek.js` | Upstream client: sessions, PoW header, completion, retries; accepts `fetchImpl` |
 | `src/pow.js` | `PowSolver` driving `assets/sha3.wasm` |
 | `src/sessions.js` | `SessionStore` (TTL + LRU) and `conversationKey` |
+| `src/cooldown.js` | `ToolCooldown`: per-tool-call delivery timestamps and tool-result wait calculation |
 | `src/errors.js` | `HttpError`, `AuthError`, `UpstreamError`, `isPowError` |
 | `src/http.js` | HTTP layer: `Gate` (concurrency + request delay), auth, routes, `handleCompletion` |
 | `src/server.js` | Compatibility shim re-exporting `createServer` and the openai helpers |
@@ -76,6 +77,10 @@ Import from the lowest module that declares the symbol; avoid cycles (only
 - `requestDelaySeconds` is the user-facing pacing knob and hot-reloads through
   `TokenStore`; `0` disables it, and `minIntervalMs` is the fallback. The first
   request after a router start is intentionally immediate.
+- `toolResultDelaySeconds` / `toolResultSkipAfterSeconds` add a cooldown after
+  tool results; they hot-reload through `TokenStore`. Unknown call ids get the
+  full cooldown. Keep the tool-call recording in both streaming and
+  non-streaming response paths in sync.
 - Upstream header order mirrors the web client's XHR wire order: PoW/hif before
   `x-client-*`, `content-length` immediately before `origin`, and no
   `priority`. Keep `browserHeaders`, `orderWithContentLength`, and the tests in

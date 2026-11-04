@@ -133,6 +133,14 @@ export function loadConfig() {
         file.requestDelaySeconds,
     ),
     minIntervalMs: Number(env.UPSTREAM_MIN_INTERVAL_MS ?? file.minIntervalMs ?? 400),
+    toolResultDelaySeconds: secondsValue(
+      env.DEEPSEEK_TOOL_RESULT_DELAY_SECONDS ?? file.toolResultDelaySeconds,
+    ),
+    toolResultSkipAfterSeconds: secondsValue(
+      env.DEEPSEEK_TOOL_RESULT_SKIP_AFTER_SECONDS ??
+        file.toolResultSkipAfterSeconds ??
+        8,
+    ),
     concurrency: Math.max(1, Number(env.UPSTREAM_CONCURRENCY ?? file.concurrency ?? 1)),
     sessionTtlMs: Number(env.SESSION_TTL_MS ?? file.sessionTtlMs ?? 6 * 60 * 60 * 1000),
     maxSessions: Number(env.MAX_SESSIONS ?? file.maxSessions ?? 500),
