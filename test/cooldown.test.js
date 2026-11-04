@@ -136,27 +136,25 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 test('ToolCooldown waits after a recent tool result', () => {
   let now = 1_000;
-  const cooldown = new ToolCooldown({ now: () => now });
+  const cooldown = new ToolCooldown({ now: () => now, random: () => 0 });
   cooldown.record([{ id: 'call-1' }], 1_000);
 
   now = 1_500;
   const assistant = { tool_calls: [{ id: 'call-1' }] };
   const toolMessages = [{ role: 'tool', tool_call_id: 'call-1', content: 'ok' }];
   assert.equal(cooldown.executionMs({ assistant, toolMessages }), 500);
-  assert.equal(
-    cooldown.delayFor({ assistant, toolMessages, delayMs: 4_000, skipAfterMs: 8_000 }),
-    4_000,
-  );
+  const request = { assistant, toolMessages, delayMs: 4_000, skipAfterMs: 8_000 };
+  assert.equal(cooldown.delayFor(request), 2_800);
+
+  cooldown.random = () => 1;
+  assert.equal(cooldown.delayFor(request), 3_800);
 
   now = 9_000;
-  assert.equal(
-    cooldown.delayFor({ assistant, toolMessages, delayMs: 4_000, skipAfterMs: 8_000 }),
-    0,
-  );
+  assert.equal(cooldown.delayFor(request), 0);
 });
 
 test('ToolCooldown skips unknown ids, disabled waits, and user turns', () => {
-  const cooldown = new ToolCooldown({ now: () => 10_000 });
+  const cooldown = new ToolCooldown({ now: () => 10_000, random: () => 0 });
   cooldown.record([{ id: 'known' }], 9_000);
 
   assert.equal(
@@ -166,7 +164,7 @@ test('ToolCooldown skips unknown ids, disabled waits, and user turns', () => {
       delayMs: 4_000,
       skipAfterMs: 8_000,
     }),
-    4_000,
+    2_800,
   );
   assert.equal(
     cooldown.delayFor({
@@ -224,11 +222,11 @@ test('tool result requests wait for the configured cooldown', async () => {
       assert.equal((await second.json()).choices[0].message.content, 'done');
       assert.equal(calls.length, 2);
       assert.ok(
-        calls[1].at - followUpAt >= 150,
+        calls[1].at - followUpAt >= 200,
         `cooldown was ${calls[1].at - followUpAt}ms`,
       );
     },
-    { config: { toolResultDelaySeconds: 0.2, toolResultSkipAfterSeconds: 5 } },
+    { config: { toolResultDelaySeconds: 0.4, toolResultSkipAfterSeconds: 5 } },
   );
 });
 

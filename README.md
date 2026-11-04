@@ -311,14 +311,16 @@ millisecond fallback. The short session-create -> PoW -> completion chain for
 one turn is not delayed, because the PoW challenge is time-limited.
 
 Tool loops get an extra cooldown. When a tool result comes back,
-`toolResultDelaySeconds` waits that many seconds before the follow-up
-completion request is sent upstream. The router measures the tool's execution
-time from when it delivered the assistant tool-call response until the result
+`toolResultDelaySeconds` waits a randomly jittered fraction of that value
+before the follow-up completion request is sent upstream: 70-95%, so `4` means
+roughly 2.8-3.8 seconds rather than an exact four-second beat. The router never
+waits longer than the configured value. It measures the tool's execution time
+from when it delivered the assistant tool-call response until the result
 request arrived. If that time is at least `toolResultSkipAfterSeconds`, the
 cooldown is skipped because the tool already took long enough. `0` disables the
 cooldown. If the timing is unknown (for example after a router restart), the
-full cooldown is applied rather than risking a burst. Both settings are
-hot-reloaded and are separate from `requestDelaySeconds`, which spaces the
+full jittered cooldown is applied rather than risking a burst. Both settings
+are hot-reloaded and are separate from `requestDelaySeconds`, which spaces the
 starts of all upstream requests.
 
 ### Browser fingerprint
@@ -390,7 +392,7 @@ this directory), plus environment variables. Environment variables win. Set
 | `port` | `PORT` | `8788` | Listen port |
 | `requestDelaySeconds` | `DEEPSEEK_REQUEST_DELAY_SECONDS` | — | Wait this many seconds before each upstream request; `0` disables it; hot-reloaded (falls back to `minIntervalMs` when unset) |
 | `minIntervalMs` | `UPSTREAM_MIN_INTERVAL_MS` | `400` | Millisecond fallback spacing when `requestDelaySeconds` is unset |
-| `toolResultDelaySeconds` | `DEEPSEEK_TOOL_RESULT_DELAY_SECONDS` | — | Wait this many seconds after a tool result arrives before sending the follow-up; `0` disables it; hot-reloaded |
+| `toolResultDelaySeconds` | `DEEPSEEK_TOOL_RESULT_DELAY_SECONDS` | — | Base wait after a tool result before sending the follow-up; the actual wait is jittered to 70-95% of this value; `0` disables it; hot-reloaded |
 | `toolResultSkipAfterSeconds` | `DEEPSEEK_TOOL_RESULT_SKIP_AFTER_SECONDS` | `8` | Skip the tool-result cooldown when the tool already ran at least this long |
 | `concurrency` | `UPSTREAM_CONCURRENCY` | `1` | Parallel upstream completions |
 | `sessionTtlMs` | `SESSION_TTL_MS` | `21600000` | Session cache lifetime (6h) |

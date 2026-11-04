@@ -78,9 +78,10 @@ Import from the lowest module that declares the symbol; avoid cycles (only
   `TokenStore`; `0` disables it, and `minIntervalMs` is the fallback. The first
   request after a router start is intentionally immediate.
 - `toolResultDelaySeconds` / `toolResultSkipAfterSeconds` add a cooldown after
-  tool results; they hot-reload through `TokenStore`. Unknown call ids get the
-  full cooldown. Keep the tool-call recording in both streaming and
-  non-streaming response paths in sync.
+  tool results; the configured delay is jittered down to 70-95% so repeated
+  tool turns are not metronomic. They hot-reload through `TokenStore`. Unknown
+  call ids get the full jittered cooldown. Keep the tool-call recording in both
+  streaming and non-streaming response paths in sync.
 - Upstream header order mirrors the web client's XHR wire order: PoW/hif before
   `x-client-*`, `content-length` immediately before `origin`, and no
   `priority`. Keep `browserHeaders`, `orderWithContentLength`, and the tests in

@@ -8,6 +8,17 @@
 
 const DEFAULT_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_MAX = 2048;
+// Keep the configured value as an upper bound but vary the actual wait, so a
+// sequence of tool calls does not look like a metronome. A 4s setting becomes
+// roughly 2.8-3.8s; the server never waits longer than configured.
+const JITTER_MIN = 0.7;
+const JITTER_MAX = 0.95;
+
+function jitterMs(ms, random) {
+  const sample = Number(random());
+  const unit = Number.isFinite(sample) ? Math.min(1, Math.max(0, sample)) : 0;
+  return Math.max(1, Math.round(ms * (JITTER_MIN + unit * (JITTER_MAX - JITTER_MIN))));
+}
 
 function toolCallIds(toolCalls) {
   const ids = new Set();
@@ -28,10 +39,16 @@ function resultCallIds(assistant, toolMessages) {
 }
 
 export class ToolCooldown {
-  constructor({ ttlMs = DEFAULT_TTL_MS, max = DEFAULT_MAX, now = Date.now } = {}) {
+  constructor({
+    ttlMs = DEFAULT_TTL_MS,
+    max = DEFAULT_MAX,
+    now = Date.now,
+    random = Math.random,
+  } = {}) {
     this.ttlMs = Math.max(0, Number(ttlMs) || 0);
     this.max = Math.max(1, Number(max) || 1);
     this.now = now;
+    this.random = random;
     this.deliveredAt = new Map();
   }
 
@@ -66,11 +83,11 @@ export class ToolCooldown {
     const execution = this.executionMs({ assistant, toolMessages }, at);
     // Unknown execution time: pace the result anyway, because a missing
     // timestamp must not turn into a burst for the upstream rate limiter.
-    if (execution == null) return Math.round(wait);
+    if (execution == null) return jitterMs(wait, this.random);
 
     const skip = Number(skipAfterMs);
     if (Number.isFinite(skip) && skip >= 0 && execution >= skip) return 0;
-    return Math.round(wait);
+    return jitterMs(wait, this.random);
   }
 
   _prune(now) {

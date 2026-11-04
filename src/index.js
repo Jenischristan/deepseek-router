@@ -79,9 +79,10 @@ export async function runForeground() {
   console.log(
     `  tool cooldown: ${
       config.toolResultDelaySeconds != null && config.toolResultDelaySeconds > 0
-        ? `${config.toolResultDelaySeconds}s (skip after ${
-          config.toolResultSkipAfterSeconds ?? 8
-        }s execution)`
+        ? `${config.toolResultDelaySeconds}s base (` +
+          `${(config.toolResultDelaySeconds * 0.7).toFixed(1)}-` +
+          `${(config.toolResultDelaySeconds * 0.95).toFixed(1)}s actual, skip after ` +
+          `${config.toolResultSkipAfterSeconds ?? 8}s execution)`
         : 'disabled'
     }`,
   );
