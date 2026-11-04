@@ -34,7 +34,7 @@ single quotes, trailing commas, ESM imports.
 | `src/pow.js` | `PowSolver` driving `assets/sha3.wasm` |
 | `src/sessions.js` | `SessionStore` (TTL + LRU) and `conversationKey` |
 | `src/errors.js` | `HttpError`, `AuthError`, `UpstreamError`, `isPowError` |
-| `src/http.js` | HTTP layer: `Gate` (concurrency + min interval), auth, routes, `handleCompletion` |
+| `src/http.js` | HTTP layer: `Gate` (concurrency + request delay), auth, routes, `handleCompletion` |
 | `src/server.js` | Compatibility shim re-exporting `createServer` and the openai helpers |
 | `src/openai/models.js` | Model list/aliases, `buildSeedPrompt`, response shaping (`completionResponse`, `chunk`, `usageChunk`) |
 | `src/openai/sse.js` | `consumeDeepSeekStream` — DeepSeek patch SSE -> fragments/status/usage |
@@ -73,6 +73,9 @@ Import from the lowest module that declares the symbol; avoid cycles (only
   gzip/deflate/br.
 - `hifDliqRefresh` is off by default because `hif-dliq.deepseek.com` is
   IPv6-only on some networks; the static `hifDliq` value is still sent.
+- `requestDelaySeconds` is the user-facing pacing knob and hot-reloads through
+  `TokenStore`; `0` disables it, and `minIntervalMs` is the fallback. The first
+  request after a router start is intentionally immediate.
 - Upstream header order mirrors the web client's XHR wire order: PoW/hif before
   `x-client-*`, `content-length` immediately before `origin`, and no
   `priority`. Keep `browserHeaders`, `orderWithContentLength`, and the tests in

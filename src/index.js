@@ -69,7 +69,13 @@ export async function runForeground() {
   console.log(
     `  transport: ${transport ? `firefox sidecar (${config.transportProfile})` : 'node fetch'}`,
   );
-  console.log(`  upstream: serialized, min interval ${config.minIntervalMs}ms`);
+  console.log(
+    `  upstream: serialized, request delay ${
+      config.requestDelaySeconds != null
+        ? `${config.requestDelaySeconds}s`
+        : `${config.minIntervalMs}ms`
+    }`,
+  );
 
   let closing = false;
   function shutdown(signal) {

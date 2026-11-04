@@ -144,6 +144,13 @@ static int run_start(int argc, char **argv, int start) {
       setenv("INJECT_TOOL_PROMPT", "0", 1);
     } else if (strcmp(argv[i], "--no-tool-parse") == 0) {
       setenv("PARSE_TOOL_CALLS", "0", 1);
+    } else if (strcmp(argv[i], "--request-delay") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "deepseek-router: %s requires a value\n", argv[i - 1]);
+        free(args);
+        return 2;
+      }
+      setenv("DEEPSEEK_REQUEST_DELAY_SECONDS", argv[i], 1);
     } else if (strcmp(argv[i], "--transport") == 0) {
       if (++i >= argc) {
         fprintf(stderr, "deepseek-router: %s requires a value\n", argv[i - 1]);
@@ -247,6 +254,7 @@ static void usage(FILE *out) {
     "  -H, --host HOST                      listen host (default 127.0.0.1)\n"
     "      --no-tool-prompt                 disable DSML prompt injection\n"
     "      --no-tool-parse                  disable DSML tool-call parsing\n"
+    "      --request-delay SECONDS          wait between request starts (0 disables)\n"
     "      --transport MODE                 firefox (default) or node\n"
     "      --transport-profile NAME         tls-client profile (default firefox_159)\n"
     "      --transport-binary PATH          Firefox transport sidecar path\n"
@@ -268,6 +276,7 @@ static void usage(FILE *out) {
     "  PORT, HOST, DEEPSEEK_ROUTER_ROOT, DEEPSEEK_ROUTER_CONFIG_FILE\n"
     "  INJECT_TOOL_PROMPT, PARSE_TOOL_CALLS\n"
     "  DEEPSEEK_ROUTER_KEY, UPSTREAM_MIN_INTERVAL_MS, UPSTREAM_CONCURRENCY\n"
+    "  DEEPSEEK_REQUEST_DELAY_SECONDS\n"
     "  DEEPSEEK_TRANSPORT, DEEPSEEK_TRANSPORT_PROFILE, DEEPSEEK_TRANSPORT_BINARY\n"
     "  DEEPSEEK_HIF_DLIQ_REFRESH\n"
     "\n"

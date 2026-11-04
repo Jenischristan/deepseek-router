@@ -75,6 +75,13 @@ function boolValue(value, fallback) {
   return fallback;
 }
 
+export function secondsValue(value) {
+  if (value == null || value === '') return null;
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  return seconds;
+}
+
 function envAccounts() {
   if (!process.env.DEEPSEEK_ACCOUNTS) return [];
   try {
@@ -120,6 +127,11 @@ export function loadConfig() {
     apiKey: env.DEEPSEEK_ROUTER_KEY || file.apiKey || '',
     host: env.HOST || file.host || '127.0.0.1',
     port: Number(env.PORT || file.port || 8788),
+    requestDelaySeconds: secondsValue(
+      env.DEEPSEEK_REQUEST_DELAY_SECONDS ??
+        env.REQUEST_DELAY_SECONDS ??
+        file.requestDelaySeconds,
+    ),
     minIntervalMs: Number(env.UPSTREAM_MIN_INTERVAL_MS ?? file.minIntervalMs ?? 400),
     concurrency: Math.max(1, Number(env.UPSTREAM_CONCURRENCY ?? file.concurrency ?? 1)),
     sessionTtlMs: Number(env.SESSION_TTL_MS ?? file.sessionTtlMs ?? 6 * 60 * 60 * 1000),

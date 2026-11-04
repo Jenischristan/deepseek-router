@@ -20,13 +20,41 @@ const MAX_BODY_BYTES = 16 * 1024 * 1024;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function configDelayMs(config) {
+  const seconds = Number(config.requestDelaySeconds);
+  if (
+    config.requestDelaySeconds != null &&
+    config.requestDelaySeconds !== '' &&
+    Number.isFinite(seconds) &&
+    seconds >= 0
+  ) {
+    return Math.round(seconds * 1000);
+  }
+  const interval = Number(config.minIntervalMs);
+  return Number.isFinite(interval) && interval >= 0 ? interval : 0;
+}
+
 class Gate {
-  constructor({ concurrency = 1, minIntervalMs = 400 } = {}) {
+  constructor({ concurrency = 1, minIntervalMs = 400, delayMsProvider = null } = {}) {
     this.concurrency = Math.max(1, concurrency);
     this.minIntervalMs = Math.max(0, minIntervalMs);
+    this.delayMsProvider = delayMsProvider;
     this.active = 0;
     this.queue = [];
     this.lastStart = 0;
+  }
+
+  delayMs() {
+    if (this.delayMsProvider) {
+      try {
+        const value = Number(this.delayMsProvider());
+        if (Number.isFinite(value) && value >= 0) return value;
+      } catch {
+        // A broken config reload must not take requests down; use the
+        // startup value instead.
+      }
+    }
+    return this.minIntervalMs;
   }
 
   async acquire(signal) {
@@ -51,7 +79,7 @@ class Gate {
     if (signal?.aborted) throw new UpstreamError('Client closed request', { status: 499 });
 
     this.active += 1;
-    const wait = this.lastStart + this.minIntervalMs - Date.now();
+    const wait = this.lastStart + this.delayMs() - Date.now();
     if (wait > 0) await sleep(wait);
 
     if (signal?.aborted) {
@@ -64,7 +92,7 @@ class Gate {
 
   // Spacing for an extra upstream request made while the slot is already held.
   async pace(signal) {
-    const wait = this.lastStart + this.minIntervalMs - Date.now();
+    const wait = this.lastStart + this.delayMs() - Date.now();
     if (wait > 0) await sleep(wait);
     if (signal?.aborted) throw new UpstreamError('Client closed request', { status: 499 });
     this.lastStart = Date.now();
@@ -440,7 +468,11 @@ export function createServer({ config, tokenStore, client }) {
   });
   const gate = new Gate({
     concurrency: config.concurrency,
-    minIntervalMs: config.minIntervalMs,
+    minIntervalMs: configDelayMs(config),
+    delayMsProvider:
+      typeof tokenStore.requestDelayMs === 'function'
+        ? () => tokenStore.requestDelayMs()
+        : null,
   });
 
   async function handleCompletion(req, res) {
@@ -1177,6 +1209,7 @@ export function createServer({ config, tokenStore, client }) {
         name: 'deepseek-router',
         upstream: tokenStore.status(),
         sessions: sessions.size,
+        requestDelaySeconds: gate.delayMs() / 1000,
         toolPrompt: config.injectToolPrompt !== false,
         toolParse: config.parseToolCalls !== false,
         toolRepair: config.repairToolCalls !== false ? clampInt(config.maxToolRepairs, 0, 5, 2) : 0,

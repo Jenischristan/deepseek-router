@@ -36,6 +36,8 @@ const ENV_KEYS = [
   'PORT',
   'UPSTREAM_MIN_INTERVAL_MS',
   'UPSTREAM_CONCURRENCY',
+  'DEEPSEEK_REQUEST_DELAY_SECONDS',
+  'REQUEST_DELAY_SECONDS',
   'SESSION_TTL_MS',
   'MAX_SESSIONS',
   'INJECT_TOOL_PROMPT',
@@ -138,10 +140,55 @@ test('loadConfig defaults browser fingerprint settings', () => {
     assert.equal(cfg.acceptEncoding, DEFAULT_ACCEPT_ENCODING);
     assert.equal(cfg.secGpc, true);
     assert.equal(cfg.hifDliqRefresh, false);
+    assert.equal(cfg.requestDelaySeconds, null);
     assert.equal(cfg.transport, 'firefox');
     assert.match(cfg.transportBinary, /transport\/deepseek-transport$/);
     assert.equal(cfg.transportProfile, 'firefox_159');
   });
+});
+
+test('loadConfig reads requestDelaySeconds from the file and env', () => {
+  const file = path.join(os.tmpdir(), `deepseek-router-delay-${process.pid}.json`);
+  fs.writeFileSync(file, JSON.stringify({ requestDelaySeconds: 4 }));
+  try {
+    withEnv({ DEEPSEEK_ROUTER_CONFIG_FILE: file }, () => {
+      assert.equal(loadConfig().requestDelaySeconds, 4);
+    });
+    withEnv(
+      { DEEPSEEK_ROUTER_CONFIG_FILE: file, DEEPSEEK_REQUEST_DELAY_SECONDS: '0' },
+      () => {
+        assert.equal(loadConfig().requestDelaySeconds, 0);
+      },
+    );
+  } finally {
+    fs.unlinkSync(file);
+  }
+});
+
+test('TokenStore hot-reloads requestDelaySeconds', () => {
+  const file = path.join(os.tmpdir(), `deepseek-router-delay-store-${process.pid}.json`);
+  fs.writeFileSync(file, JSON.stringify({ token: 'a', requestDelaySeconds: 4 }));
+  try {
+    const store = new TokenStore({
+      token: 'a',
+      requestDelaySeconds: 4,
+      minIntervalMs: 400,
+      configFile: file,
+    });
+    assert.equal(store.requestDelayMs(), 4000);
+
+    fs.writeFileSync(file, JSON.stringify({ token: 'a', requestDelaySeconds: 0 }));
+    let stamp = new Date(Date.now() + 1000);
+    fs.utimesSync(file, stamp, stamp);
+    assert.equal(store.requestDelayMs(), 0);
+
+    fs.writeFileSync(file, JSON.stringify({ token: 'a' }));
+    stamp = new Date(Date.now() + 2000);
+    fs.utimesSync(file, stamp, stamp);
+    assert.equal(store.requestDelayMs(), 400);
+  } finally {
+    fs.unlinkSync(file);
+  }
 });
 
 test('loadConfig reads pacing and rotation settings from the config file', () => {

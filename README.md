@@ -139,6 +139,7 @@ deepseek-router                     # start in the background
 deepseek-router start --port 9000   # override port/host
 deepseek-router start --foreground  # attached, with live logs
 deepseek-router start --transport node     # opt out of the Go sidecar
+deepseek-router start --request-delay 4    # wait 4s between request starts
 deepseek-router logs -n 100         # recent background log lines
 deepseek-router status              # running? which pid?
 deepseek-router stop                # stop the background server
@@ -163,7 +164,7 @@ repository path as a fallback.
   (`{"token":"..."}`, optional `cookies`/`hifLeim`/`hifDliq`, `persist`
   defaults to true)
 - `POST /v1/sessions/clear` — drop cached upstream sessions
-- `GET /health` — status, active account, session count
+- `GET /health` — status, active account, session count, current request delay
 
 ### Examples
 
@@ -300,10 +301,14 @@ interpret it. This is useful for observing what the model emits on its own.
    before their TTL expires.
 
 Upstream requests are serialized (one at a time by default, with a small gap)
-and use browser-like headers. `minIntervalMs` spaces chat turns, account
-failover attempts, uploads, and repair calls. The short session-create -> PoW ->
-completion chain for one turn is not delayed, because the PoW challenge is
-time-limited.
+and use browser-like headers. `requestDelaySeconds` sets the wait before each
+new upstream request, in seconds: `0` disables the delay, `4` waits four
+seconds. It applies to chat turns, account failover attempts, uploads, and
+repair calls, and is hot-reloaded from `config.json`, so an edit applies to the
+next request without restarting. The first request after a router start is not
+delayed. If `requestDelaySeconds` is unset, `minIntervalMs` is used as the
+millisecond fallback. The short session-create -> PoW -> completion chain for
+one turn is not delayed, because the PoW challenge is time-limited.
 
 ### Browser fingerprint
 
@@ -372,7 +377,8 @@ this directory), plus environment variables. Environment variables win. Set
 | `apiKey` | `DEEPSEEK_ROUTER_KEY` | — | Require this key on `/v1/*` |
 | `host` | `HOST` | `127.0.0.1` | Listen address |
 | `port` | `PORT` | `8788` | Listen port |
-| `minIntervalMs` | `UPSTREAM_MIN_INTERVAL_MS` | `400` | Minimum gap between chat request starts, account failover attempts, uploads, and repairs |
+| `requestDelaySeconds` | `DEEPSEEK_REQUEST_DELAY_SECONDS` | — | Wait this many seconds before each upstream request; `0` disables it; hot-reloaded (falls back to `minIntervalMs` when unset) |
+| `minIntervalMs` | `UPSTREAM_MIN_INTERVAL_MS` | `400` | Millisecond fallback spacing when `requestDelaySeconds` is unset |
 | `concurrency` | `UPSTREAM_CONCURRENCY` | `1` | Parallel upstream completions |
 | `sessionTtlMs` | `SESSION_TTL_MS` | `21600000` | Session cache lifetime (6h) |
 | `maxSessions` | `MAX_SESSIONS` | `500` | Session cache size |
@@ -396,7 +402,7 @@ this directory), plus environment variables. Environment variables win. Set
 
 See `config.example.json`. `minIntervalMs`, `concurrency`, and
 `hifDliqRefresh` are read at startup; restart after changing them. Account
-changes and `accountSwitchAfter` are hot-reloaded.
+changes, `accountSwitchAfter`, and `requestDelaySeconds` are hot-reloaded.
 
 ### Multiple accounts
 

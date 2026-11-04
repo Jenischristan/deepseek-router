@@ -1062,6 +1062,36 @@ test('gate: account failover is spaced by minIntervalMs', async () => {
   assert.ok(times[1] - times[0] >= 60, `failover gap was ${times[1] - times[0]}ms`);
 });
 
+test('gate: requestDelaySeconds spaces requests', async () => {
+  const times = [];
+  await withServer(
+    async () => {
+      times.push(Date.now());
+      return 'ok';
+    },
+    async ({ base }) => {
+      await chat(base, { messages: [{ role: 'user', content: 'a' }] });
+      await chat(base, { messages: [{ role: 'user', content: 'b' }] });
+      assert.equal(times.length, 2);
+      assert.ok(times[1] - times[0] >= 60, `delay was ${times[1] - times[0]}ms`);
+    },
+    { config: { requestDelaySeconds: 0.08, minIntervalMs: 0 } },
+  );
+});
+
+test('gate: requestDelaySeconds 0 overrides minIntervalMs', async () => {
+  const started = Date.now();
+  await withServer(
+    async () => 'ok',
+    async ({ base }) => {
+      await chat(base, { messages: [{ role: 'user', content: 'a' }] });
+      await chat(base, { messages: [{ role: 'user', content: 'b' }] });
+    },
+    { config: { requestDelaySeconds: 0, minIntervalMs: 5000 } },
+  );
+  assert.ok(Date.now() - started < 2000, `requests took ${Date.now() - started}ms`);
+});
+
 test('gate: concurrency=3 allows parallelism up to the limit', async () => {
   let inFlight = 0;
   let maxInFlight = 0;

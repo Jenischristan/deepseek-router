@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { configFilePath, normalizeAccounts } from './config.js';
+import { configFilePath, normalizeAccounts, secondsValue } from './config.js';
 
 const RELOAD_INTERVAL_MS = 5000;
 // A token that returned an auth failure is skipped for this long before it is
@@ -30,6 +30,8 @@ export class TokenStore {
     this.index = 0;
     this.switchAfter = normalizeSwitchAfter(cfg.accountSwitchAfter);
     this.messagesOnAccount = 0;
+    this.requestDelaySeconds = secondsValue(cfg.requestDelaySeconds);
+    this.minIntervalMs = Math.max(0, Number(cfg.minIntervalMs) || 0);
     this.tokenFile = cfg.tokenFile || '';
     // `null` disables disk reloads, which tests use to stay hermetic. The
     // default keeps watching the user's config file.
@@ -43,6 +45,9 @@ export class TokenStore {
     this._envHif = Boolean(process.env.DEEPSEEK_HIF_LEIM);
     this._envHifDliq = Boolean(process.env.DEEPSEEK_HIF_DLIQ);
     this._envSwitchAfter = process.env.DEEPSEEK_ACCOUNT_SWITCH_AFTER != null;
+    this._envRequestDelay =
+      process.env.DEEPSEEK_REQUEST_DELAY_SECONDS != null ||
+      process.env.REQUEST_DELAY_SECONDS != null;
     // token -> expiry timestamp (ms). Populated by markFailed().
     this._quarantine = new Map();
     // token -> expiry timestamp (ms) for interactive challenges. Tracked
@@ -151,6 +156,12 @@ export class TokenStore {
         }
       }
 
+      // Pacing is hot-reloaded: requestDelayMs() reads the config file directly
+      // so an edit applies to the next request without a restart.
+      if (!this._envRequestDelay) {
+        this.requestDelaySeconds = secondsValue(cfg.requestDelaySeconds);
+      }
+
       if (this._envAccounts) return;
 
       const accounts = normalizeAccounts(cfg.accounts);
@@ -223,6 +234,14 @@ export class TokenStore {
   current() {
     this._maybeReload();
     return this.accounts[this.index] || null;
+  }
+
+  requestDelayMs() {
+    this._readConfig();
+    if (this.requestDelaySeconds != null) {
+      return Math.round(this.requestDelaySeconds * 1000);
+    }
+    return this.minIntervalMs;
   }
 
   async get() {

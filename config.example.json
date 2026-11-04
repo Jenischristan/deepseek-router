@@ -8,6 +8,7 @@
   "apiKey": "",
   "host": "127.0.0.1",
   "port": 8788,
+  "requestDelaySeconds": 0,
   "minIntervalMs": 400,
   "concurrency": 1,
   "sessionTtlMs": 21600000,
