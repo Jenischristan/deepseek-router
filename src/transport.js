@@ -217,12 +217,12 @@ function stopChild(child) {
 }
 
 /**
- * Start the optional Firefox transport sidecar. Returns null for the default
- * Node transport, and throws when Firefox transport was requested but the
- * binary or profile is unavailable.
+ * Start the Firefox transport sidecar. Returns null only when the Node
+ * transport is explicitly selected, and throws when Firefox transport is
+ * requested but the binary or profile is unavailable.
  */
 export async function startTransport(config) {
-  const mode = String(config?.transport || 'node').toLowerCase();
+  const mode = String(config?.transport || 'firefox').toLowerCase();
   if (mode === 'node') return null;
   if (mode !== 'firefox') {
     throw new Error(`unknown transport '${config.transport}' (use node or firefox)`);

@@ -138,7 +138,7 @@ test('loadConfig defaults browser fingerprint settings', () => {
     assert.equal(cfg.acceptEncoding, DEFAULT_ACCEPT_ENCODING);
     assert.equal(cfg.secGpc, true);
     assert.equal(cfg.hifDliqRefresh, false);
-    assert.equal(cfg.transport, 'node');
+    assert.equal(cfg.transport, 'firefox');
     assert.match(cfg.transportBinary, /transport\/deepseek-transport$/);
     assert.equal(cfg.transportProfile, 'firefox_159');
   });

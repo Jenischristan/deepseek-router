@@ -9,7 +9,7 @@ npm test              # node --test (all tests)
 node --test test/tools.test.js   # one file
 make                  # build the optional C launcher
 make install          # symlink ./deepseek-router into ~/.local/bin
-make transport        # build the optional Go Firefox transport sidecar
+make transport        # build the default Go Firefox transport sidecar
 node --check src/main.js         # syntax check (repeat per file)
 python3 -m py_compile scripts/get-token.py
 cd transport && go test ./...    # sidecar tests (local HTTP/2 upstream)
@@ -29,7 +29,7 @@ single quotes, trailing commas, ESM imports.
 | `src/token.js` | `TokenStore`: account queue, rotation, config/token-file hot reload |
 | `src/hif.js` | `HifStore`: fetches/refreshes `x-hif-leim`; optional `x-hif-dliq` refresh (off by default) |
 | `src/fetch.js` | `withZstd`: decodes `content-encoding: zstd`; default `accept-encoding` |
-| `src/transport.js` | Optional Firefox sidecar lifecycle + fetch wrapper (loopback, shared key, DeepSeek host allowlist) |
+| `src/transport.js` | Default Firefox sidecar lifecycle + fetch wrapper (loopback, shared key, DeepSeek host allowlist) |
 | `src/deepseek.js` | Upstream client: sessions, PoW header, completion, retries; accepts `fetchImpl` |
 | `src/pow.js` | `PowSolver` driving `assets/sha3.wasm` |
 | `src/sessions.js` | `SessionStore` (TTL + LRU) and `conversationKey` |
@@ -66,8 +66,8 @@ Import from the lowest module that declares the symbol; avoid cycles (only
 - The pid/log files live in `~/.config/deepseek-router/`; `DEEPSEEK_ROUTER_FOREGROUND=1`
   is set by the detached child so the same code path serves both modes.
 - Config keys added to code must also be added to `README.md` and `config.example.json`.
-- The Firefox transport is opt-in (`transport: "firefox"` or `DEEPSEEK_TRANSPORT=firefox`);
-  keep `node` as the default and keep both sides' host allowlists in sync.
+- The Firefox transport is the default (`transport: "firefox"`); `node` is the
+  opt-out. Keep both sides' host allowlists in sync.
 - The sidecar keeps response bodies compressed (`DisableCompression`) so the
   router can decode them; `withZstd` handles zstd, and Node fetch handles
   gzip/deflate/br.

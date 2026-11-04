@@ -212,7 +212,7 @@ static void print_paths(const char *root) {
 
   const char *transport = getenv("DEEPSEEK_TRANSPORT");
   const char *profile = getenv("DEEPSEEK_TRANSPORT_PROFILE");
-  printf("mode:     %s\n", transport && *transport ? transport : "node (default)");
+  printf("mode:     %s\n", transport && *transport ? transport : "firefox (default)");
   printf("profile:  %s\n", profile && *profile ? profile : "firefox_159 (default)");
 
   const char *config = getenv("DEEPSEEK_ROUTER_CONFIG_FILE");
@@ -247,16 +247,16 @@ static void usage(FILE *out) {
     "  -H, --host HOST                      listen host (default 127.0.0.1)\n"
     "      --no-tool-prompt                 disable DSML prompt injection\n"
     "      --no-tool-parse                  disable DSML tool-call parsing\n"
-    "      --transport MODE                 node (default) or firefox\n"
+    "      --transport MODE                 firefox (default) or node\n"
     "      --transport-profile NAME         tls-client profile (default firefox_159)\n"
     "      --transport-binary PATH          Firefox transport sidecar path\n"
     "      --hif-dliq-refresh               refresh x-hif-dliq (IPv6-only host)\n"
     "      --no-hif-dliq-refresh            keep the configured x-hif-dliq (default)\n"
     "  -f, --foreground                     stay attached to the terminal\n"
     "\n"
-    "Firefox transport:\n"
+    "Firefox transport (default):\n"
     "  make transport                       build transport/deepseek-transport\n"
-    "  deepseek-router start --transport firefox\n"
+    "  deepseek-router start --transport node  opt out of the sidecar\n"
     "\n"
     "Token examples:\n"
     "  deepseek-router token --list\n"

@@ -156,7 +156,7 @@ export function loadConfig() {
       file.acceptEncoding ||
       DEFAULT_ACCEPT_ENCODING,
     secGpc: boolValue(env.DEEPSEEK_SEC_GPC ?? file.secGpc, true),
-    transport: String(env.DEEPSEEK_TRANSPORT || file.transport || 'node').toLowerCase(),
+    transport: String(env.DEEPSEEK_TRANSPORT || file.transport || 'firefox').toLowerCase(),
     transportBinary:
       env.DEEPSEEK_TRANSPORT_BINARY ||
       file.transportBinary ||

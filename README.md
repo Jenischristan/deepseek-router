@@ -6,15 +6,15 @@ with the site's own WASM solver, and exposes standard `/v1/chat/completions`
 and `/v1/models` endpoints. Multiple accounts can be queued for automatic
 failover and scheduled rotation.
 
-No npm packages, no pip packages. The default router has no required build
-step; the optional C launcher and Go Firefox-transport sidecar are described
-below.
+No npm packages, no pip packages. The default router uses the Firefox
+transport sidecar, so build it once to get started; the optional C launcher is
+described below.
 
 ## Requirements
 
 - Node.js 20.3+ (uses built-in `fetch`, `AbortSignal.any`)
 - Python 3.10+ (only for `scripts/get-token.py`)
-- Go 1.24+ (only to build the optional Firefox transport sidecar)
+- Go 1.24+ (to build the default Firefox transport sidecar)
 - One or more logged-in DeepSeek accounts in Zen/Firefox profiles (see
   [Multiple accounts](#multiple-accounts-automatic-collection))
 
@@ -138,7 +138,7 @@ deepseek-router --help
 deepseek-router                     # start in the background
 deepseek-router start --port 9000   # override port/host
 deepseek-router start --foreground  # attached, with live logs
-deepseek-router start --transport firefox  # use the Go sidecar
+deepseek-router start --transport node     # opt out of the Go sidecar
 deepseek-router logs -n 100         # recent background log lines
 deepseek-router status              # running? which pid?
 deepseek-router stop                # stop the background server
@@ -323,19 +323,19 @@ fetch handles gzip/deflate/br itself; the router decompresses zstd before the
 JSON/SSE parser sees it. On Node builds without zstd support the default falls
 back to `gzip, deflate, br`.
 
-By default, network-level fingerprints (HTTP/2 and TLS/JA3) still come from
-Node, not Firefox, so headers and cookies can match while transport metadata
-differs. The optional Firefox transport below replaces Node's HTTP/1.1/OpenSSL
-stack with a Firefox-impersonating HTTP/2 client.
+By default, the router sends chat and hif requests through the Firefox
+transport sidecar below, so network-level fingerprints (HTTP/2 and TLS/JA3)
+match Firefox as well. Set `transport: "node"` to fall back to Node's
+HTTP/1.1/OpenSSL stack.
 
-### Firefox transport (optional)
+### Firefox transport (default)
 
-Build the sidecar and enable it:
+Build the sidecar once:
 
 ```bash
 make transport
-DEEPSEEK_TRANSPORT=firefox npm start
-# or set "transport": "firefox" in config.json
+npm start
+# or set "transport": "firefox" in config.json (the default)
 ```
 
 The router starts `transport/deepseek-transport` on a random loopback port,
@@ -388,7 +388,7 @@ this directory), plus environment variables. Environment variables win. Set
 | `acceptLanguage` | `DEEPSEEK_ACCEPT_LANGUAGE` | `en-US,en;q=0.9` | `accept-language` header |
 | `acceptEncoding` | `DEEPSEEK_ACCEPT_ENCODING` | `gzip, deflate, br, zstd` | `accept-encoding` header; zstd is decoded by the router |
 | `secGpc` | `DEEPSEEK_SEC_GPC` | `true` | Send `sec-gpc: 1` like Firefox with Global Privacy Control enabled |
-| `transport` | `DEEPSEEK_TRANSPORT` | `node` | `node` (built-in fetch) or `firefox` (Go sidecar) |
+| `transport` | `DEEPSEEK_TRANSPORT` | `firefox` | `firefox` (Go sidecar, default) or `node` (built-in fetch) |
 | `transportBinary` | `DEEPSEEK_TRANSPORT_BINARY` | `transport/deepseek-transport` | Sidecar binary path |
 | `transportProfile` | `DEEPSEEK_TRANSPORT_PROFILE` | `firefox_159` | tls-client browser profile (`firefox_159`, `firefox_148`, ...) |
 | `wasmPath` | `SHA3_WASM` | `assets/sha3.wasm` | Path to the PoW solver wasm |
