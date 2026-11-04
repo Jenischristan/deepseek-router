@@ -2,7 +2,8 @@
 """Extract a DeepSeek web session from a local Zen or Firefox profile.
 
 Reads the localStorage entry `userToken` (plus optional cookies and the
-`hif_leim_cached` value) without touching the browser's live databases.
+`hif_leim_cached`/`hif_dliq_cached` values) without touching the browser's
+live databases.
 
 Examples:
     python3 scripts/get-token.py
@@ -52,6 +53,7 @@ class Profile:
     source: str
     token: Optional[str] = None
     hif_leim: Optional[str] = None
+    hif_dliq: Optional[str] = None
     ls_db: Optional[Path] = None
     active: bool = False
     mtime: float = 0.0
@@ -431,6 +433,14 @@ def read_legacy_token(profile: Path, tempdir: Path) -> Optional[str]:
         connection.close()
 
 
+def cookie_expiry_ms(value) -> int:
+    """Normalise a moz_cookies.expiry value (seconds or milliseconds)."""
+    if not value:
+        return 0
+    value = int(value)
+    return value if value > 10**12 else value * 1000
+
+
 def read_cookies(
     profile: Path, tempdir: Path, user_context_id: Optional[int] = None
 ) -> tuple[list[str], str]:
@@ -442,15 +452,15 @@ def read_cookies(
     try:
         try:
             rows = connection.execute(
-                "SELECT name, value, originAttributes FROM moz_cookies "
-                "WHERE host LIKE ? OR host LIKE ?",
+                "SELECT name, value, path, creationTime, expiry, originAttributes "
+                "FROM moz_cookies WHERE host LIKE ? OR host LIKE ?",
                 ("%deepseek.com", "%chat.deepseek.com"),
             ).fetchall()
         except sqlite3.DatabaseError:
             try:
                 rows = connection.execute(
-                    "SELECT name, value, '' FROM moz_cookies "
-                    "WHERE host LIKE ? OR host LIKE ?",
+                    "SELECT name, value, path, creationTime, expiry, '' "
+                    "FROM moz_cookies WHERE host LIKE ? OR host LIKE ?",
                     ("%deepseek.com", "%chat.deepseek.com"),
                 ).fetchall()
             except sqlite3.DatabaseError:
@@ -458,16 +468,20 @@ def read_cookies(
     finally:
         connection.close()
 
+    now_ms = int(time.time() * 1000)
     rows = [
         row
         for row in rows
-        if origin_user_context_id(row[2] or "") == user_context_id
+        if origin_user_context_id(row[5] or "") == user_context_id
+        and row[0]
+        and row[1] is not None
+        and (not row[4] or cookie_expiry_ms(row[4]) > now_ms)
     ]
-    rows.sort(key=lambda row: (0 if row[0] == "smidV2" else 1, row[0]))
-    names = [row[0] for row in rows if row[0]]
-    cookie_header = "; ".join(
-        f"{name}={value}" for name, value, _ in rows if name and value is not None
-    )
+    # Firefox sends cookies with the longest path first, then the oldest
+    # first. Matching that order keeps the Cookie header browser-like.
+    rows.sort(key=lambda row: (-len(row[2] or "/"), row[3] or 0, row[0]))
+    names = [row[0] for row in rows]
+    cookie_header = "; ".join(f"{name}={value}" for name, value, *_ in rows)
     return names, cookie_header
 
 
@@ -535,9 +549,12 @@ def analyze_profile(profile: Profile, tempdir: Path) -> list[Profile]:
         context.mtime = max(mtimes, default=0.0)
 
         try:
-            values = read_ls_keys(db, ("userToken", "hif_leim_cached"), tempdir)
+            values = read_ls_keys(
+                db, ("userToken", "hif_leim_cached", "hif_dliq_cached"), tempdir
+            )
             context.token = values.get("userToken")
             context.hif_leim = values.get("hif_leim_cached")
+            context.hif_dliq = values.get("hif_dliq_cached")
         except Exception as exc:
             context.error = f"{db}: {exc}"
 
@@ -609,6 +626,7 @@ def account_details(
         "cookies": cookie_header,
         "cookieNames": cookie_names,
         "hifLeim": (profile.hif_leim or "") if include_hif else "",
+        "hifDliq": (profile.hif_dliq or "") if include_hif else "",
         "extractedAt": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -619,6 +637,8 @@ def config_account(details: dict) -> dict:
         account["cookies"] = details["cookies"]
     if details["hifLeim"]:
         account["hifLeim"] = details["hifLeim"]
+    if details["hifDliq"]:
+        account["hifDliq"] = details["hifDliq"]
     return account
 
 
@@ -695,7 +715,7 @@ def upsert_config_account(path: Path, account: dict) -> tuple[int, bool]:
     """Add or refresh one account in the config's `accounts` array.
 
     Returns (1-based position, changed). The legacy top-level token/cookies/
-    hifLeim keys are migrated into `accounts` and then removed.
+    hifLeim/hifDliq keys are migrated into `accounts` and then removed.
     """
     current = load_config(path)
     entries = current.get("accounts")
@@ -719,6 +739,8 @@ def upsert_config_account(path: Path, account: dict) -> tuple[int, bool]:
                 legacy["cookies"] = current["cookies"]
             if isinstance(current.get("hifLeim"), str) and current["hifLeim"]:
                 legacy["hifLeim"] = current["hifLeim"]
+            if isinstance(current.get("hifDliq"), str) and current["hifDliq"]:
+                legacy["hifDliq"] = current["hifDliq"]
             normalized.append(legacy)
 
     index = next(
@@ -737,7 +759,7 @@ def upsert_config_account(path: Path, account: dict) -> tuple[int, bool]:
         changed = True
     else:
         existing = normalized[index]
-        for key in ("cookies", "hifLeim"):
+        for key in ("cookies", "hifLeim", "hifDliq"):
             value = account.get(key)
             if value and existing.get(key) != value:
                 existing[key] = value
@@ -747,6 +769,7 @@ def upsert_config_account(path: Path, account: dict) -> tuple[int, bool]:
     current.pop("token", None)
     current.pop("cookies", None)
     current.pop("hifLeim", None)
+    current.pop("hifDliq", None)
 
     if changed:
         save_config(path, current)
@@ -760,7 +783,7 @@ def print_accounts(accounts: list[dict]) -> None:
             f"{index:<3} "
             f"{'yes' if account['active'] else 'no':<7} "
             f"{len(account['cookieNames']):<8} "
-            f"{'yes' if account['hifLeim'] else 'no':<5} "
+            f"{'yes' if account['hifLeim'] or account['hifDliq'] else 'no':<5} "
             f"{mask_token(account['token']):<20} "
             f"{account['profile']}"
         )
@@ -799,7 +822,7 @@ def print_table(profiles: list[Profile]) -> None:
         print(
             f"{'yes' if profile.active else 'no':<7} "
             f"{'yes' if profile.token else 'no':<6} "
-            f"{'yes' if profile.hif_leim else 'no':<5} "
+            f"{'yes' if profile.hif_leim or profile.hif_dliq else 'no':<5} "
             f"{modified:<17} {profile.label}"
         )
         if profile.error:
@@ -880,7 +903,7 @@ def watch_accounts(args, config_path: Path) -> int:
                             f"captured account {position}: {profile.label} "
                             f"(token {mask_token(profile.token)}, "
                             f"cookies {'yes' if details['cookies'] else 'no'}, "
-                            f"hif {'yes' if details['hifLeim'] else 'no'})",
+                            f"hif {'yes' if details['hifLeim'] or details['hifDliq'] else 'no'})",
                             file=sys.stderr,
                         )
             finally:
@@ -975,7 +998,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-hif",
         action="store_true",
-        help="do not include the hif_leim value in output or config",
+        help="do not include the hif_leim/hif_dliq values in output or config",
     )
     parser.add_argument(
         "--quiet",
@@ -1065,7 +1088,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 write_config(
                     config_path,
                     {"accounts": [config_account(item) for item in details]},
-                    remove=("token", "cookies", "hifLeim"),
+                    remove=("token", "cookies", "hifLeim", "hifDliq"),
                 )
 
             if args.token_only:
@@ -1124,6 +1147,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         cookie_names = payload["cookieNames"]
         cookie_header = payload["cookies"]
         hif_leim = payload["hifLeim"]
+        hif_dliq = payload["hifDliq"]
 
         if args.write:
             existing = load_config(config_path)
@@ -1134,6 +1158,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     account["cookies"] = cookie_header
                 if hif_leim:
                     account["hifLeim"] = hif_leim
+                if hif_dliq:
+                    account["hifDliq"] = hif_dliq
                 position, _ = upsert_config_account(config_path, account)
                 if not args.quiet:
                     print(
@@ -1147,6 +1173,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     patch["cookies"] = cookie_header
                 if hif_leim:
                     patch["hifLeim"] = hif_leim
+                if hif_dliq:
+                    patch["hifDliq"] = hif_dliq
                 write_config(config_path, patch)
 
         if args.token_only:
@@ -1172,7 +1200,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             if args.no_hif:
                 print("HIF:     (skipped)")
             else:
-                print(f"HIF:     {'yes' if hif_leim else 'no'}")
+                print(f"HIF:     {'yes' if hif_leim or hif_dliq else 'no'}")
             if args.write:
                 print(f"Config:  {config_path} (mode 600)")
             else:

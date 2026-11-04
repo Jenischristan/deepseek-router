@@ -424,15 +424,34 @@ export function toolChoiceMode(choice) {
   return { mode: 'auto' };
 }
 
+// toolSignature is deterministic for a given (tools array, choice, parallel)
+// triple. Clients reuse the same parsed tool array for every turn, so cache the
+// SHA-256 per array: the outer WeakMap keys on array identity, the inner Map on
+// the choice/parallel pair. Saves ~40us per tool-heavy request.
+const toolSignatureCache = new WeakMap();
+
 export function toolSignature(tools, toolChoice, parallelToolCalls) {
+  const parallel = parallelToolCalls !== false;
+  const list = Array.isArray(tools) ? tools : [];
+  let byOptions = toolSignatureCache.get(list);
+  if (!byOptions) {
+    byOptions = new Map();
+    toolSignatureCache.set(list, byOptions);
+  }
+  const cacheKey = `${parallel ? 1 : 0}\u0000${stableStringify(toolChoice ?? null)}`;
+  const cached = byOptions.get(cacheKey);
+  if (cached) return cached;
+
   const payload = {
-    tools: tools.map((tool) => ({
+    tools: list.map((tool) => ({
       name: tool.name,
       description: tool.description,
       parameters: tool.parameters,
     })),
     choice: toolChoice,
-    parallel: parallelToolCalls !== false,
+    parallel,
   };
-  return crypto.createHash('sha256').update(stableStringify(payload)).digest('hex');
+  const signature = crypto.createHash('sha256').update(stableStringify(payload)).digest('hex');
+  byOptions.set(cacheKey, signature);
+  return signature;
 }

@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 
 import { saveConfig } from './config.js';
-import { AuthError, HttpError, UpstreamError } from './errors.js';
+import { AuthError, ChallengeError, HttpError, UpstreamError } from './errors.js';
 import { SessionStore, conversationKey } from './sessions.js';
 import { MODELS, buildSeedPrompt, chunk, completionResponse, contentToText, dataUrlToBuffer, estimateTokens, extractImages, makeId, openaiError, resolveModel, usageChunk } from './openai/models.js';
 import { consumeDeepSeekStream, fragmentsText } from './openai/sse.js';
@@ -257,7 +257,23 @@ function assistantToolCalls(toolCalls) {
   }));
 }
 
+function challengeErrorFor(accountNumber) {
+  return new ChallengeError(
+    `DeepSeek account ${accountNumber} requires manual verification (captcha/challenge).`,
+  );
+}
+
+// The active index can move when the config is hot-reloaded, so resolve the
+// number from the token when possible.
+function accountNumberFor(tokenStore, token) {
+  const accounts = Array.isArray(tokenStore.accounts) ? tokenStore.accounts : [];
+  const index = token ? accounts.findIndex((account) => account.token === token) : -1;
+  return index >= 0 ? index + 1 : tokenStore.active + 1;
+}
+
 function isAccountFailure(error) {
+  // ChallengeError is an UpstreamError with status 403, so this also rotates
+  // past an account that needs a human.
   if (error instanceof AuthError) return true;
   return (
     error instanceof UpstreamError &&
@@ -266,6 +282,25 @@ function isAccountFailure(error) {
       error.status === 429 ||
       error.code === 50006)
   );
+}
+
+// Walk past accounts that are waiting for a human. rotate() already skips
+// quarantined tokens, but when every account is quarantined it falls back to
+// round-robin, so bound the walk to one full cycle.
+function nextUsableAccount(tokenStore, triedAccounts, currentToken) {
+  const count = Math.max(1, tokenStore.count);
+  for (let step = 0; step < count; step += 1) {
+    const candidate = tokenStore.rotate();
+    if (
+      candidate?.token &&
+      candidate.token !== currentToken &&
+      !triedAccounts.has(candidate.token) &&
+      !tokenStore.isChallenged?.(candidate.token)
+    ) {
+      return candidate;
+    }
+  }
+  return null;
 }
 
 function mappingFromAssistant(assistant) {
@@ -308,11 +343,16 @@ function rememberSession({
     ...(toolCalls.length ? { toolCalls: mapping } : {}),
   };
 
+  // Normalise the prefix once; the reasoning variant only differs by the
+  // trailing assistant message, so reuse the shared head instead of re-mapping
+  // every prior message a second time.
+  const normalizedPrefix = normalizeMessagesForCache(messages);
+
   sessions.set(
     conversationKey(
       modelType,
       thinking,
-      normalizeMessagesForCache([...messages, assistant]),
+      [...normalizedPrefix, ...normalizeMessagesForCache([assistant])],
       toolsKey,
       accountToken,
     ),
@@ -328,7 +368,7 @@ function rememberSession({
       conversationKey(
         modelType,
         thinking,
-        normalizeMessagesForCache([...messages, assistantWithReasoning]),
+        [...normalizedPrefix, ...normalizeMessagesForCache([assistantWithReasoning])],
         toolsKey,
         accountToken,
       ),
@@ -520,11 +560,23 @@ export function createServer({ config, tokenStore, client }) {
       await gate.acquire(controller.signal);
       acquired = true;
 
+      // Normalise each distinct message array once. The attempt loop calls
+      // keyFor with the same `turn.prefix` for every retry/account, so a
+      // WeakMap keyed on the array avoids re-mapping the whole transcript on
+      // each iteration.
+      const normalizedCache = new WeakMap();
+      const normalizedFor = (items) => {
+        const cached = normalizedCache.get(items);
+        if (cached) return cached;
+        const normalized = normalizeMessagesForCache(items);
+        normalizedCache.set(items, normalized);
+        return normalized;
+      };
       const keyFor = (items, accountToken) =>
         conversationKey(
           model.modelType,
           thinking,
-          normalizeMessagesForCache(items),
+          normalizedFor(items),
           toolsKey,
           accountToken,
         );
@@ -565,8 +617,20 @@ export function createServer({ config, tokenStore, client }) {
       };
 
       for (let attempt = 0; ; attempt += 1) {
-        const account = tokenStore.current();
+        let account = tokenStore.current();
         if (!account?.token) throw new AuthError('No DeepSeek token configured');
+        // Do not touch an account that is waiting for interactive
+        // verification. Move to the next usable account and only surface the
+        // challenge when no other account can take over.
+        if (tokenStore.isChallenged?.(account.token)) {
+          const challengedAccount = accountNumberFor(tokenStore, account.token);
+          account = nextUsableAccount(tokenStore, triedAccounts, account.token);
+          if (!account) throw challengeErrorFor(challengedAccount);
+        }
+        // Failover happens inside one client request, so acquire() spacing
+        // does not cover it. Pace each retry instead of cycling every account
+        // in a couple of seconds.
+        if (attempt > 0) await gate.pace(controller.signal);
         triedAccounts.add(account.token);
 
         let attemptSessionId = null;
@@ -635,7 +699,14 @@ export function createServer({ config, tokenStore, client }) {
           });
           usedAccount = account;
         } catch (error) {
-          const failedAccount = tokenStore.active + 1;
+          const failedAccount = accountNumberFor(tokenStore, account.token);
+          const challenge = error instanceof ChallengeError;
+
+          // An interactive challenge needs a human. Quarantine the account
+          // and continue with the next one instead of leaving the router
+          // pinned to an account that will keep failing.
+          if (challenge) tokenStore.markChallenge?.(account.token);
+
           // Read the live count here: rotate() reloads the config, so the
           // account list can change while this request is in flight.
           const maxAccountAttempts = Math.max(1, tokenStore.count);
@@ -644,13 +715,27 @@ export function createServer({ config, tokenStore, client }) {
               ? tokenStore.rotate(account.token)
               : null;
 
-          if (!next || next.token === account.token || triedAccounts.has(next.token)) {
+          sessions.deleteByAccount(account.token);
+
+          if (
+            !next ||
+            next.token === account.token ||
+            triedAccounts.has(next.token) ||
+            tokenStore.isChallenged?.(next.token)
+          ) {
+            if (challenge) {
+              log.warn(
+                `account ${failedAccount} requires manual verification (captcha/challenge)`,
+              );
+              throw challengeErrorFor(failedAccount);
+            }
             throw error;
           }
 
-          sessions.deleteByAccount(account.token);
           log.warn(
-            `account ${failedAccount} failed (${error.message}); switching to account ${tokenStore.active + 1}`,
+            challenge
+              ? `account ${failedAccount} requires manual verification (captcha/challenge); switching to account ${tokenStore.active + 1}`
+              : `account ${failedAccount} failed (${error.message}); switching to account ${tokenStore.active + 1}`,
           );
           continue;
         }
@@ -755,6 +840,7 @@ export function createServer({ config, tokenStore, client }) {
             latest = interpretAttempt(result);
             attempts.push(latest);
           } catch (error) {
+            if (error instanceof ChallengeError) throw error;
             if (controller.signal.aborted) throw error;
             log.warn(`tool call repair failed: ${error.message}`);
             break;
@@ -1056,6 +1142,17 @@ export function createServer({ config, tokenStore, client }) {
         `POST /v1/chat/completions 200 ${Date.now() - startedAt}ms model=${model.id} stream=true` +
           summary(repairs, toolCalls),
       );
+    } catch (error) {
+      // A challenge can also arrive inside an already-open SSE stream, after
+      // the attempt loop has finished. Quarantine the account that was used
+      // and move the store off it so the next request starts elsewhere.
+      if (error instanceof ChallengeError && usedAccount?.token) {
+        tokenStore.markChallenge?.(usedAccount.token);
+        sessions.deleteByAccount(usedAccount.token);
+        tokenStore.rotate(usedAccount.token);
+        throw challengeErrorFor(accountNumberFor(tokenStore, usedAccount.token));
+      }
+      throw error;
     } finally {
       res.off('close', onClose);
       if (acquired) gate.release();
@@ -1135,6 +1232,7 @@ export function createServer({ config, tokenStore, client }) {
         patch.token = body.token.trim();
         if (typeof body.cookies === 'string') patch.cookies = body.cookies;
         if (typeof body.hifLeim === 'string') patch.hifLeim = body.hifLeim;
+        if (typeof body.hifDliq === 'string') patch.hifDliq = body.hifDliq;
       }
 
       tokenStore.update(patch);

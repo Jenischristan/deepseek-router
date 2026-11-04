@@ -1,4 +1,4 @@
-import { UpstreamError } from '../errors.js';
+import { ChallengeError, UpstreamError, isChallengeMessage } from '../errors.js';
 
 // DeepSeek SSE stream parser
 // ===========================================================================
@@ -173,8 +173,12 @@ export async function consumeDeepSeekStream(response, handlers = {}) {
     if (eventName === 'hint') {
       if (data?.type === 'error') {
         const finish = data.finish_reason || null;
+        const text = data.content || data.message || 'DeepSeek rejected the request';
+        if (isChallengeMessage(text) || isChallengeMessage(finish)) {
+          throw new ChallengeError(text);
+        }
         const rateLimited = finish === 'rate_limit_reached';
-        throw new UpstreamError(data.content || data.message || 'DeepSeek rejected the request', {
+        throw new UpstreamError(text, {
           status: rateLimited ? 429 : 502,
           code: finish || data.type || null,
           type: rateLimited ? 'rate_limit_error' : 'upstream_error',
@@ -191,7 +195,11 @@ export async function consumeDeepSeekStream(response, handlers = {}) {
     }
 
     if (eventName === 'error') {
-      throw new UpstreamError(data.msg || data.message || 'DeepSeek stream error', {
+      const text = data.msg || data.message || 'DeepSeek stream error';
+      if (isChallengeMessage(text) || isChallengeMessage(data.code)) {
+        throw new ChallengeError(text);
+      }
+      throw new UpstreamError(text, {
         code: data.code ?? null,
       });
     }
@@ -202,7 +210,9 @@ export async function consumeDeepSeekStream(response, handlers = {}) {
       data.v == null &&
       data.p == null
     ) {
-      throw new UpstreamError(data.msg || `DeepSeek error ${data.code}`, {
+      const text = data.msg || `DeepSeek error ${data.code}`;
+      if (isChallengeMessage(text)) throw new ChallengeError(text);
+      throw new UpstreamError(text, {
         code: data.code,
       });
     }

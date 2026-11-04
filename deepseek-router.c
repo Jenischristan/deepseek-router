@@ -144,6 +144,31 @@ static int run_start(int argc, char **argv, int start) {
       setenv("INJECT_TOOL_PROMPT", "0", 1);
     } else if (strcmp(argv[i], "--no-tool-parse") == 0) {
       setenv("PARSE_TOOL_CALLS", "0", 1);
+    } else if (strcmp(argv[i], "--transport") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "deepseek-router: %s requires a value\n", argv[i - 1]);
+        free(args);
+        return 2;
+      }
+      setenv("DEEPSEEK_TRANSPORT", argv[i], 1);
+    } else if (strcmp(argv[i], "--transport-profile") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "deepseek-router: %s requires a value\n", argv[i - 1]);
+        free(args);
+        return 2;
+      }
+      setenv("DEEPSEEK_TRANSPORT_PROFILE", argv[i], 1);
+    } else if (strcmp(argv[i], "--transport-binary") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "deepseek-router: %s requires a value\n", argv[i - 1]);
+        free(args);
+        return 2;
+      }
+      setenv("DEEPSEEK_TRANSPORT_BINARY", argv[i], 1);
+    } else if (strcmp(argv[i], "--hif-dliq-refresh") == 0) {
+      setenv("DEEPSEEK_HIF_DLIQ_REFRESH", "1", 1);
+    } else if (strcmp(argv[i], "--no-hif-dliq-refresh") == 0) {
+      setenv("DEEPSEEK_HIF_DLIQ_REFRESH", "0", 1);
     } else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--foreground") == 0) {
       args[index++] = (char *)"--foreground";
     } else {
@@ -181,12 +206,20 @@ static void print_paths(const char *root) {
   printf("root:     %s\n", root);
   printf("server:   %s/src/main.js\n", root);
   printf("token:    %s/scripts/get-token.py\n", root);
+  printf("sidecar:  %s/transport/deepseek-transport\n", root);
   printf("node:     %s\n", find_program("node", found, sizeof found) ? found : "(not found)");
   printf("python3:  %s\n", find_program("python3", found, sizeof found) ? found : "(not found)");
 
+  const char *transport = getenv("DEEPSEEK_TRANSPORT");
+  const char *profile = getenv("DEEPSEEK_TRANSPORT_PROFILE");
+  printf("mode:     %s\n", transport && *transport ? transport : "node (default)");
+  printf("profile:  %s\n", profile && *profile ? profile : "firefox_159 (default)");
+
+  const char *config = getenv("DEEPSEEK_ROUTER_CONFIG_FILE");
   const char *xdg = getenv("XDG_CONFIG_HOME");
   const char *home = getenv("HOME");
-  if (xdg && *xdg) printf("config:   %s/deepseek-router/config.json\n", xdg);
+  if (config && *config) printf("config:   %s\n", config);
+  else if (xdg && *xdg) printf("config:   %s/deepseek-router/config.json\n", xdg);
   else if (home && *home) printf("config:   %s/.config/deepseek-router/config.json\n", home);
 }
 
@@ -200,7 +233,6 @@ static void usage(FILE *out) {
     "  deepseek-router stop                 stop the background server\n"
     "  deepseek-router status               show pid/log state\n"
     "  deepseek-router logs [-n N]          print recent log lines\n"
-    "  deepseek-router dashboard            open the FTXUI dashboard\n"
     "  deepseek-router token [args...]      run the token helper (get-token.py)\n"
     "  deepseek-router token:write          save one browser session to the config\n"
     "  deepseek-router token:accounts       save every token-bearing account\n"
@@ -215,7 +247,16 @@ static void usage(FILE *out) {
     "  -H, --host HOST                      listen host (default 127.0.0.1)\n"
     "      --no-tool-prompt                 disable DSML prompt injection\n"
     "      --no-tool-parse                  disable DSML tool-call parsing\n"
+    "      --transport MODE                 node (default) or firefox\n"
+    "      --transport-profile NAME         tls-client profile (default firefox_159)\n"
+    "      --transport-binary PATH          Firefox transport sidecar path\n"
+    "      --hif-dliq-refresh               refresh x-hif-dliq (IPv6-only host)\n"
+    "      --no-hif-dliq-refresh            keep the configured x-hif-dliq (default)\n"
     "  -f, --foreground                     stay attached to the terminal\n"
+    "\n"
+    "Firefox transport:\n"
+    "  make transport                       build transport/deepseek-transport\n"
+    "  deepseek-router start --transport firefox\n"
     "\n"
     "Token examples:\n"
     "  deepseek-router token --list\n"
@@ -224,8 +265,11 @@ static void usage(FILE *out) {
     "  deepseek-router token:watch\n"
     "\n"
     "Environment:\n"
-    "  PORT, HOST, DEEPSEEK_ROUTER_ROOT, INJECT_TOOL_PROMPT, PARSE_TOOL_CALLS\n"
+    "  PORT, HOST, DEEPSEEK_ROUTER_ROOT, DEEPSEEK_ROUTER_CONFIG_FILE\n"
+    "  INJECT_TOOL_PROMPT, PARSE_TOOL_CALLS\n"
     "  DEEPSEEK_ROUTER_KEY, UPSTREAM_MIN_INTERVAL_MS, UPSTREAM_CONCURRENCY\n"
+    "  DEEPSEEK_TRANSPORT, DEEPSEEK_TRANSPORT_PROFILE, DEEPSEEK_TRANSPORT_BINARY\n"
+    "  DEEPSEEK_HIF_DLIQ_REFRESH\n"
     "\n"
     "Run `deepseek-router token --help` for all token-helper options.\n",
     ROUTER_VERSION);
@@ -259,11 +303,6 @@ int main(int argc, char **argv) {
   }
   if (strcmp(command, "start") == 0) return run_start(argc, argv, 2);
   if (strcmp(command, "stop") == 0 || strcmp(command, "status") == 0 || strcmp(command, "logs") == 0) {
-    char *args[] = {"node", "src/main.js", (char *)command, NULL};
-    run(args);
-    return 1;
-  }
-  if (strcmp(command, "dashboard") == 0) {
     size_t extra = (size_t)(argc > 2 ? argc - 2 : 0);
     char **args = calloc(extra + 4, sizeof *args);
     if (!args) {
@@ -273,7 +312,7 @@ int main(int argc, char **argv) {
     size_t index = 0;
     args[index++] = "node";
     args[index++] = "src/main.js";
-    args[index++] = "dashboard";
+    args[index++] = (char *)command;
     for (int i = 2; i < argc; i++) args[index++] = argv[i];
     args[index] = NULL;
     run(args);

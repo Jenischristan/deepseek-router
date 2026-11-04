@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import os from 'node:os';
 
 import { loadConfig, normalizeAccounts } from '../src/config.js';
+import { DEFAULT_ACCEPT_ENCODING } from '../src/fetch.js';
 import { SessionStore, conversationKey } from '../src/sessions.js';
 import { TokenStore } from '../src/token.js';
 
@@ -16,6 +18,14 @@ const ENV_KEYS = [
   'DEEPSEEK_USER_AGENT',
   'DEEPSEEK_COOKIES',
   'DEEPSEEK_HIF_LEIM',
+  'DEEPSEEK_HIF_DLIQ',
+  'DEEPSEEK_HIF_DLIQ_REFRESH',
+  'DEEPSEEK_ACCEPT_LANGUAGE',
+  'DEEPSEEK_ACCEPT_ENCODING',
+  'DEEPSEEK_SEC_GPC',
+  'DEEPSEEK_TRANSPORT',
+  'DEEPSEEK_TRANSPORT_BINARY',
+  'DEEPSEEK_TRANSPORT_PROFILE',
   'DEEPSEEK_TOKEN_FILE',
   'DEEPSEEK_ROUTER_CONFIG_FILE',
   'DEEPSEEK_ROUTER_KEY',
@@ -62,8 +72,8 @@ test('normalizeAccounts trims, dedupes and fills defaults', () => {
     null,
   ]);
   assert.deepEqual(accounts, [
-    { token: 'a', cookies: '', hifLeim: '' },
-    { token: 'b', cookies: 'c=1', hifLeim: '' },
+    { token: 'a', cookies: '', hifLeim: '', hifDliq: '' },
+    { token: 'b', cookies: 'c=1', hifLeim: '', hifDliq: '' },
   ]);
 });
 
@@ -74,6 +84,14 @@ test('loadConfig reads new env overrides', () => {
       DEEPSEEK_CLIENT_VERSION: '9.9.9',
       DEEPSEEK_LOCALE: 'de_DE',
       DEEPSEEK_USER_AGENT: 'test-agent',
+      DEEPSEEK_HIF_DLIQ: 'env-dliq',
+      DEEPSEEK_HIF_DLIQ_REFRESH: 'on',
+      DEEPSEEK_ACCEPT_LANGUAGE: 'de-DE,de;q=0.9',
+      DEEPSEEK_ACCEPT_ENCODING: 'gzip, br',
+      DEEPSEEK_SEC_GPC: 'off',
+      DEEPSEEK_TRANSPORT: 'FIREFOX',
+      DEEPSEEK_TRANSPORT_BINARY: '/tmp/transport',
+      DEEPSEEK_TRANSPORT_PROFILE: 'firefox_147',
       REPAIR_TOOL_CALLS: 'off',
       MAX_TOOL_REPAIRS: '4',
       LOG_LEVEL: 'debug',
@@ -84,6 +102,14 @@ test('loadConfig reads new env overrides', () => {
       assert.equal(cfg.clientVersion, '9.9.9');
       assert.equal(cfg.locale, 'de_DE');
       assert.equal(cfg.userAgent, 'test-agent');
+      assert.equal(cfg.hifDliq, 'env-dliq');
+      assert.equal(cfg.hifDliqRefresh, true);
+      assert.equal(cfg.acceptLanguage, 'de-DE,de;q=0.9');
+      assert.equal(cfg.acceptEncoding, 'gzip, br');
+      assert.equal(cfg.secGpc, false);
+      assert.equal(cfg.transport, 'firefox');
+      assert.equal(cfg.transportBinary, '/tmp/transport');
+      assert.equal(cfg.transportProfile, 'firefox_147');
       assert.equal(cfg.repairToolCalls, false);
       assert.equal(cfg.maxToolRepairs, 4);
       assert.equal(cfg.logLevel, 'debug');
@@ -97,6 +123,48 @@ test('loadConfig defaults repair settings when unset', () => {
     assert.equal(cfg.repairToolCalls, true);
     assert.equal(cfg.maxToolRepairs, 2);
   });
+});
+
+test('loadConfig defaults browser fingerprint settings', () => {
+  withEnv({}, () => {
+    const cfg = loadConfig();
+    assert.equal(cfg.clientVersion, '2.7.0');
+    assert.equal(cfg.locale, 'en_US');
+    assert.equal(
+      cfg.userAgent,
+      'Mozilla/5.0 (X11; Linux x86_64; rv:159.0) Gecko/20100101 Firefox/159.0',
+    );
+    assert.equal(cfg.acceptLanguage, 'en-US,en;q=0.9');
+    assert.equal(cfg.acceptEncoding, DEFAULT_ACCEPT_ENCODING);
+    assert.equal(cfg.secGpc, true);
+    assert.equal(cfg.hifDliqRefresh, false);
+    assert.equal(cfg.transport, 'node');
+    assert.match(cfg.transportBinary, /transport\/deepseek-transport$/);
+    assert.equal(cfg.transportProfile, 'firefox_159');
+  });
+});
+
+test('loadConfig reads pacing and rotation settings from the config file', () => {
+  const file = path.join(os.tmpdir(), `deepseek-router-config-${process.pid}.json`);
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      accounts: [{ token: 'a' }],
+      minIntervalMs: 4000,
+      concurrency: 2,
+      accountSwitchAfter: 15,
+    }),
+  );
+  try {
+    withEnv({ DEEPSEEK_ROUTER_CONFIG_FILE: file }, () => {
+      const cfg = loadConfig();
+      assert.equal(cfg.minIntervalMs, 4000);
+      assert.equal(cfg.concurrency, 2);
+      assert.equal(cfg.accountSwitchAfter, 15);
+    });
+  } finally {
+    fs.unlinkSync(file);
+  }
 });
 
 function tokenStore(tokens, switchAfter = 0) {
@@ -121,11 +189,134 @@ test('TokenStore rotate ignores a stale failed token', () => {
   assert.equal(store.rotate('other').token, 'a');
 });
 
+test('TokenStore skips a token that already failed auth', () => {
+  const store = tokenStore(['a', 'b', 'c']);
+  // Each failed token is quarantined, so the next rotation skips it.
+  assert.equal(store.rotate('a').token, 'b');
+  assert.equal(store.rotate('b').token, 'c');
+  assert.deepEqual([...store._quarantine.keys()].sort(), ['a', 'b']);
+});
+
+test('TokenStore never returns a quarantined token while a live one exists', () => {
+  const store = tokenStore(['a', 'b', 'c']);
+  store.markFailed('a');
+  store.markFailed('b');
+  // Only c is live. Repeated rotations of the failing token keep landing on c;
+  // they never hand back the quarantined a or b.
+  assert.equal(store.rotate('a').token, 'c');
+  assert.equal(store.rotate('a').token, 'c');
+  assert.equal(store.rotate('b').token, 'c');
+});
+
+test('TokenStore clears quarantine when the account list changes', () => {
+  const store = tokenStore(['a', 'b']);
+  store.markFailed('a');
+  store.update({ accounts: [{ token: 'c' }, { token: 'd' }] });
+  assert.equal(store._quarantine.size, 0);
+});
+
+test('TokenStore keeps quarantine when the account list is unchanged', () => {
+  const store = tokenStore(['a', 'b']);
+  store.markFailed('a');
+  // Simulates the periodic config reload re-applying the same accounts.
+  store.update({ accounts: [{ token: 'a' }, { token: 'b' }] });
+  assert.equal(store._quarantine.size, 1);
+});
+
+test('TokenStore round-robins once every token is quarantined', () => {
+  const store = tokenStore(['a', 'b', 'c']);
+  assert.equal(store.rotate('a').token, 'b');
+  assert.equal(store.rotate('b').token, 'c');
+  // c's failure quarantines the last live token, so the fallback is plain
+  // round-robin and the index wraps to a.
+  assert.equal(store.rotate('c').token, 'a');
+  assert.equal(store.rotate('a').token, 'b');
+});
+
+test('TokenStore falls back to round-robin when every token is quarantined', () => {
+  const store = tokenStore(['a', 'b']);
+  store.markFailed('a');
+  store.markFailed('b');
+  assert.equal(store.rotate('a').token, 'b');
+  assert.equal(store.rotate('b').token, 'a');
+});
+
+test('TokenStore quarantine expires', () => {
+  const store = tokenStore(['a', 'b']);
+  store.markFailed('a');
+  assert.equal(store.rotate('a').token, 'b');
+  // Force the quarantine entry into the past: a is selectable again.
+  store._quarantine.set('a', Date.now() - 1);
+  assert.equal(store.rotate('b').token, 'a');
+});
+
+test('TokenStore quarantines an account that needs interactive verification', () => {
+  const store = tokenStore(['a', 'b']);
+  store.markChallenge('a');
+  assert.equal(store.isChallenged('a'), true);
+  assert.equal(store.isChallenged('b'), false);
+  assert.equal(store.rotate('a').token, 'b');
+
+  const status = store.status();
+  assert.equal(status.challengeRequired, false);
+  assert.deepEqual(status.challengedAccounts, [1]);
+});
+
+test('TokenStore keeps the longer challenge quarantine when it rotates', () => {
+  const store = tokenStore(['a', 'b']);
+  store.markChallenge('a');
+  const challengeUntil = store._challenges.get('a');
+  store.rotate('a');
+  assert.ok(store._quarantine.get('a') >= challengeUntil);
+  assert.equal(store.isChallenged('a'), true);
+});
+
+test('TokenStore reports a challenge on the active account', () => {
+  const store = tokenStore(['a', 'b']);
+  store.markChallenge('a');
+  const status = store.status();
+  assert.equal(status.challengeRequired, true);
+  assert.equal(status.activeAccount, 1);
+});
+
+test('TokenStore challenge expires and is cleared by a cookie refresh', () => {
+  const store = tokenStore(['a', 'b']);
+  store.markChallenge('a');
+  store._challenges.set('a', Date.now() - 1);
+  store._quarantine.set('a', Date.now() - 1);
+  assert.equal(store.isChallenged('a'), false);
+
+  store.markChallenge('a');
+  store.update({ cookies: 'fresh=1' });
+  assert.equal(store.isChallenged('a'), false);
+  assert.equal(store._quarantine.has('a'), false);
+});
+
 test('TokenStore noteResponse switches after N messages', () => {
   const store = tokenStore(['a', 'b'], 2);
   assert.equal(store.noteResponse('a'), null);
   assert.deepEqual(store.noteResponse('a'), { from: 1, to: 2, count: 2 });
   assert.equal(store.current().token, 'b');
+});
+
+test('TokenStore noteResponse skips quarantined accounts', () => {
+  const store = tokenStore(['a', 'b', 'c'], 1);
+  store.markFailed('b');
+  assert.deepEqual(store.noteResponse('a'), { from: 1, to: 3, count: 1 });
+  assert.equal(store.current().token, 'c');
+  assert.deepEqual(store.noteResponse('c'), { from: 3, to: 1, count: 1 });
+});
+
+test('TokenStore noteResponse stays put when every other account is quarantined', () => {
+  const store = tokenStore(['a', 'b'], 1);
+  store.markFailed('b');
+  assert.equal(store.noteResponse('a'), null);
+  assert.equal(store.current().token, 'a');
+});
+
+test('TokenStore single account never rotates even after failure', () => {
+  const store = tokenStore(['a']);
+  assert.equal(store.rotate('a').token, 'a');
 });
 
 test('TokenStore single account never rotates', () => {

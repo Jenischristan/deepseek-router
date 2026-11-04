@@ -3,6 +3,8 @@
   "token": "",
   "cookies": "",
   "hifLeim": "",
+  "hifDliq": "",
+  "hifDliqRefresh": false,
   "apiKey": "",
   "host": "127.0.0.1",
   "port": 8788,
@@ -18,5 +20,12 @@
   "requestTimeoutMs": 600000,
   "clientVersion": "2.7.0",
   "locale": "en_US",
+  "userAgent": "Mozilla/5.0 (X11; Linux x86_64; rv:159.0) Gecko/20100101 Firefox/159.0",
+  "acceptLanguage": "en-US,en;q=0.9",
+  "acceptEncoding": "gzip, deflate, br",
+  "secGpc": true,
+  "transport": "node",
+  "transportBinary": "",
+  "transportProfile": "firefox_159",
   "logLevel": "info"
 }

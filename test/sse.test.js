@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { UpstreamError } from '../src/errors.js';
+import { ChallengeError, UpstreamError } from '../src/errors.js';
 import { consumeDeepSeekStream, fragmentsText } from '../src/openai/sse.js';
 
 function stream(events) {
@@ -72,6 +72,30 @@ test('throws a rate-limit UpstreamError for a hint error', async () => {
       assert.equal(error.status, 429);
       assert.equal(error.retryable, true);
       assert.equal(error.code, 'rate_limit_reached');
+      return true;
+    },
+  );
+});
+
+test('throws a ChallengeError when the stream asks for verification', async () => {
+  await assert.rejects(
+    consumeDeepSeekStream(
+      stream([
+        [
+          'hint',
+          {
+            type: 'error',
+            finish_reason: 'challenge_required',
+            content: 'CHALLENGE_REQUIRED',
+          },
+        ],
+      ]),
+    ),
+    (error) => {
+      assert.ok(error instanceof ChallengeError);
+      assert.equal(error.status, 403);
+      assert.equal(error.code, 'challenge_required');
+      assert.equal(error.retryable, false);
       return true;
     },
   );

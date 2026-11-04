@@ -313,9 +313,9 @@ test('sessions: conversationKey is sensitive to every field', () => {
 
 const tokenCfg = (overrides = {}) => ({
   accounts: [
-    { token: 'a', cookies: 'ca', hifLeim: 'ha' },
-    { token: 'b', cookies: 'cb', hifLeim: 'hb' },
-    { token: 'c', cookies: 'cc', hifLeim: 'hc' },
+    { token: 'a', cookies: 'ca', hifLeim: 'ha', hifDliq: 'da' },
+    { token: 'b', cookies: 'cb', hifLeim: 'hb', hifDliq: 'db' },
+    { token: 'c', cookies: 'cc', hifLeim: 'hc', hifDliq: 'dc' },
   ],
   configFile: null,
   ...overrides,
@@ -367,6 +367,7 @@ test('token: status() reports active account, lengths and flags', () => {
   assert.equal(status.tokenLength, 1);
   assert.equal(status.hasCookies, true);
   assert.equal(status.hasHifLeim, true);
+  assert.equal(status.hasHifDliq, true);
   assert.equal(status.hasToken, true);
 });
 
@@ -384,6 +385,14 @@ test('token: update(token) replaces the current account and dedupes', () => {
   assert.equal(store.current().token, 'a');
   assert.equal(store.cookies, 'new-cookie');
   assert.equal(store.count, 3);
+});
+
+test('token: update(hifDliq) refreshes the active account', () => {
+  const store = new TokenStore(tokenCfg());
+  store.update({ hifDliq: 'new-dliq' });
+  assert.equal(store.hifDliq, 'new-dliq');
+  assert.equal(store.hifLeim, 'ha');
+  assert.equal(store.current().token, 'a');
 });
 
 // ---------------------------------------------------------------------------
@@ -1030,6 +1039,27 @@ test('gate: concurrency=1 serialises upstream calls', async () => {
     },
     { config: { concurrency: 1 } },
   );
+});
+
+test('gate: account failover is spaced by minIntervalMs', async () => {
+  const times = [];
+  await withServer(
+    async () => {
+      times.push(Date.now());
+      if (times.length === 1) throw new AuthError('bad token');
+      return 'ok';
+    },
+    async ({ base }) => {
+      const res = await chat(base, {});
+      assert.equal(res.status, 200);
+    },
+    {
+      accounts: [{ token: 'a' }, { token: 'b' }],
+      config: { minIntervalMs: 80 },
+    },
+  );
+  assert.equal(times.length, 2);
+  assert.ok(times[1] - times[0] >= 60, `failover gap was ${times[1] - times[0]}ms`);
 });
 
 test('gate: concurrency=3 allows parallelism up to the limit', async () => {

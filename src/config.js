@@ -3,6 +3,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { DEFAULT_ACCEPT_ENCODING } from './fetch.js';
+
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const CONFIG_DIR = process.env.XDG_CONFIG_HOME
   ? path.join(process.env.XDG_CONFIG_HOME, 'deepseek-router')
@@ -46,12 +48,13 @@ export function normalizeAccounts(list) {
   for (const entry of list) {
     const account =
       typeof entry === 'string'
-        ? { token: entry.trim(), cookies: '', hifLeim: '' }
+        ? { token: entry.trim(), cookies: '', hifLeim: '', hifDliq: '' }
         : entry && typeof entry === 'object'
           ? {
             token: typeof entry.token === 'string' ? entry.token.trim() : '',
             cookies: typeof entry.cookies === 'string' ? entry.cookies : '',
             hifLeim: typeof entry.hifLeim === 'string' ? entry.hifLeim : '',
+            hifDliq: typeof entry.hifDliq === 'string' ? entry.hifDliq : '',
           }
           : null;
 
@@ -89,6 +92,7 @@ export function loadConfig() {
     token: env.DEEPSEEK_TOKEN || file.token || '',
     cookies: env.DEEPSEEK_COOKIES || file.cookies || '',
     hifLeim: env.DEEPSEEK_HIF_LEIM || file.hifLeim || '',
+    hifDliq: env.DEEPSEEK_HIF_DLIQ || file.hifDliq || '',
   };
 
   const fromEnv = envAccounts();
@@ -108,6 +112,11 @@ export function loadConfig() {
     tokenFile: env.DEEPSEEK_TOKEN_FILE || file.tokenFile || '',
     cookies: accounts[0]?.cookies || '',
     hifLeim: accounts[0]?.hifLeim || '',
+    hifDliq: accounts[0]?.hifDliq || '',
+    hifDliqRefresh: boolValue(
+      env.DEEPSEEK_HIF_DLIQ_REFRESH ?? file.hifDliqRefresh,
+      false,
+    ),
     apiKey: env.DEEPSEEK_ROUTER_KEY || file.apiKey || '',
     host: env.HOST || file.host || '127.0.0.1',
     port: Number(env.PORT || file.port || 8788),
@@ -139,7 +148,21 @@ export function loadConfig() {
     userAgent:
       env.DEEPSEEK_USER_AGENT ||
       file.userAgent ||
-      'Mozilla/5.0 (X11; Linux x86_64; rv:158.0) Gecko/20100101 Firefox/158.0',
+      'Mozilla/5.0 (X11; Linux x86_64; rv:159.0) Gecko/20100101 Firefox/159.0',
+    acceptLanguage:
+      env.DEEPSEEK_ACCEPT_LANGUAGE || file.acceptLanguage || 'en-US,en;q=0.9',
+    acceptEncoding:
+      env.DEEPSEEK_ACCEPT_ENCODING ||
+      file.acceptEncoding ||
+      DEFAULT_ACCEPT_ENCODING,
+    secGpc: boolValue(env.DEEPSEEK_SEC_GPC ?? file.secGpc, true),
+    transport: String(env.DEEPSEEK_TRANSPORT || file.transport || 'node').toLowerCase(),
+    transportBinary:
+      env.DEEPSEEK_TRANSPORT_BINARY ||
+      file.transportBinary ||
+      path.join(ROOT, 'transport', 'deepseek-transport'),
+    transportProfile:
+      env.DEEPSEEK_TRANSPORT_PROFILE || file.transportProfile || 'firefox_159',
     wasmPath: env.SHA3_WASM || file.wasmPath || path.join(ROOT, 'assets', 'sha3.wasm'),
     logLevel: env.LOG_LEVEL || file.logLevel || 'info',
   };
@@ -149,7 +172,7 @@ export function loadConfig() {
       const token = fs.readFileSync(cfg.tokenFile, 'utf8').trim();
       if (token) {
         cfg.accounts = normalizeAccounts([
-          { ...(cfg.accounts[0] || { cookies: '', hifLeim: '' }), token },
+          { ...(cfg.accounts[0] || { cookies: '', hifLeim: '', hifDliq: '' }), token },
           ...cfg.accounts.slice(1),
         ]);
         cfg.token = cfg.accounts[0].token;

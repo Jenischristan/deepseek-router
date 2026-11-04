@@ -2,12 +2,19 @@ import fs from 'node:fs';
 import { configFilePath, normalizeAccounts } from './config.js';
 
 const RELOAD_INTERVAL_MS = 5000;
+// A token that returned an auth failure is skipped for this long before it is
+// tried again. Keeps a dead token from being retried on every rotation cycle,
+// while still letting a re-logged-in session be picked up after a cooldown.
+const QUARANTINE_MS = 10 * 60 * 1000;
+// Interactive verification cannot be fixed by retrying. Keep the account out
+// of rotation long enough for the user to complete it in the browser.
+const CHALLENGE_QUARANTINE_MS = 30 * 60 * 1000;
 
 function accountsFromConfig(cfg) {
   const accounts = normalizeAccounts(cfg.accounts);
   if (accounts.length) return accounts;
   return normalizeAccounts([
-    { token: cfg.token, cookies: cfg.cookies, hifLeim: cfg.hifLeim },
+    { token: cfg.token, cookies: cfg.cookies, hifLeim: cfg.hifLeim, hifDliq: cfg.hifDliq },
   ]);
 }
 
@@ -34,17 +41,78 @@ export class TokenStore {
     this._envToken = Boolean(process.env.DEEPSEEK_TOKEN);
     this._envCookies = Boolean(process.env.DEEPSEEK_COOKIES);
     this._envHif = Boolean(process.env.DEEPSEEK_HIF_LEIM);
+    this._envHifDliq = Boolean(process.env.DEEPSEEK_HIF_DLIQ);
     this._envSwitchAfter = process.env.DEEPSEEK_ACCOUNT_SWITCH_AFTER != null;
+    // token -> expiry timestamp (ms). Populated by markFailed().
+    this._quarantine = new Map();
+    // token -> expiry timestamp (ms) for interactive challenges. Tracked
+    // separately from auth failures so /health can report the difference.
+    this._challenges = new Map();
+  }
+
+  _isQuarantined(token, now = Date.now()) {
+    const until = this._quarantine.get(token);
+    if (!until) return false;
+    if (until <= now) {
+      this._quarantine.delete(token);
+      return false;
+    }
+    return true;
+  }
+
+  _isChallenged(token, now = Date.now()) {
+    const until = this._challenges.get(token);
+    if (!until) return false;
+    if (until <= now) {
+      this._challenges.delete(token);
+      return false;
+    }
+    return true;
+  }
+
+  markFailed(token) {
+    if (!token) return;
+    const until = Date.now() + QUARANTINE_MS;
+    // Do not shorten a longer quarantine (for example the 30-minute
+    // interactive-challenge window) when this token is also rotated away.
+    const existing = this._quarantine.get(token);
+    if (existing && existing > until) return;
+    this._quarantine.set(token, until);
+  }
+
+  markChallenge(token, cooldownMs = CHALLENGE_QUARANTINE_MS) {
+    if (!token) return;
+    const until = Date.now() + cooldownMs;
+    this._challenges.set(token, until);
+    this._quarantine.set(token, until);
+  }
+
+  isChallenged(token = null) {
+    this._maybeReload();
+    const active = token ?? this.accounts[this.index]?.token;
+    return this._isChallenged(active);
   }
 
   _replaceAccounts(list) {
     const currentToken = this.accounts[this.index]?.token;
+    const changed =
+      list.length !== this.accounts.length ||
+      list.some(
+        (account, i) =>
+          account.token !== this.accounts[i]?.token ||
+          account.cookies !== this.accounts[i]?.cookies ||
+          account.hifLeim !== this.accounts[i]?.hifLeim ||
+          account.hifDliq !== this.accounts[i]?.hifDliq,
+      );
     this.accounts = list;
     const index = currentToken
       ? list.findIndex((account) => account.token === currentToken)
       : -1;
     this.index = index >= 0 ? index : 0;
     this.messagesOnAccount = 0;
+    // A freshly synced token should be tried immediately instead of waiting
+    // out a cooldown earned by a stale token it replaced.
+    if (changed) this.clearQuarantine();
   }
 
   _readTokenFile() {
@@ -57,7 +125,7 @@ export class TokenStore {
         if (token) {
           this._replaceAccounts(
             normalizeAccounts([
-              { ...(this.accounts[0] || { cookies: '', hifLeim: '' }), token },
+              { ...(this.accounts[0] || { cookies: '', hifLeim: '', hifDliq: '' }), token },
               ...this.accounts.slice(1),
             ]),
           );
@@ -88,13 +156,19 @@ export class TokenStore {
       const accounts = normalizeAccounts(cfg.accounts);
       if (accounts.length) {
         if (this._envToken) {
-          const envAccount = this.accounts[0] || { token: '', cookies: '', hifLeim: '' };
+          const envAccount = this.accounts[0] || {
+            token: '',
+            cookies: '',
+            hifLeim: '',
+            hifDliq: '',
+          };
           this._replaceAccounts(
             normalizeAccounts([
               {
                 token: process.env.DEEPSEEK_TOKEN,
                 cookies: envAccount.cookies,
                 hifLeim: envAccount.hifLeim,
+                hifDliq: envAccount.hifDliq,
               },
               ...accounts,
             ]),
@@ -105,7 +179,12 @@ export class TokenStore {
         return;
       }
 
-      const current = this.accounts[0] || { token: '', cookies: '', hifLeim: '' };
+      const current = this.accounts[0] || {
+        token: '',
+        cookies: '',
+        hifLeim: '',
+        hifDliq: '',
+      };
       const primary = {
         token:
           !this._envToken && typeof cfg.token === 'string' && cfg.token
@@ -119,6 +198,10 @@ export class TokenStore {
           !this._envHif && typeof cfg.hifLeim === 'string'
             ? cfg.hifLeim
             : current.hifLeim,
+        hifDliq:
+          !this._envHifDliq && typeof cfg.hifDliq === 'string'
+            ? cfg.hifDliq
+            : current.hifDliq,
       };
 
       if (primary.token) {
@@ -154,6 +237,10 @@ export class TokenStore {
     return this.current()?.hifLeim || '';
   }
 
+  get hifDliq() {
+    return this.current()?.hifDliq || '';
+  }
+
   get count() {
     this._maybeReload();
     return this.accounts.length;
@@ -173,9 +260,36 @@ export class TokenStore {
       return current;
     }
 
-    this.index = (this.index + 1) % this.accounts.length;
+    // Quarantine the token that just failed so it is skipped on subsequent
+    // rotations instead of being retried on every cycle.
+    if (failedToken) this.markFailed(failedToken);
+
+    // Walk forward to the next token that is not quarantined. If every
+    // account is quarantined, fall back to plain round-robin so a config
+    // refresh or a recovered token is never permanently locked out.
+    const now = Date.now();
+    const start = this.index;
+    for (let step = 1; step <= this.accounts.length; step += 1) {
+      const next = (start + step) % this.accounts.length;
+      if (!this._isQuarantined(this.accounts[next]?.token, now)) {
+        this.index = next;
+        this.messagesOnAccount = 0;
+        return this.accounts[this.index];
+      }
+    }
+
+    // Every account is quarantined: fall back to plain round-robin.
+    this.index = (start + 1) % this.accounts.length;
     this.messagesOnAccount = 0;
     return this.accounts[this.index];
+  }
+
+  // Re-enable every quarantined token (e.g. after the user re-syncs their
+  // browser session). Called when the account list changes so a refreshed
+  // token is not skipped for the rest of its cooldown.
+  clearQuarantine() {
+    this._quarantine.clear();
+    this._challenges.clear();
   }
 
   noteResponse(token = null) {
@@ -190,6 +304,21 @@ export class TokenStore {
 
     const from = this.index + 1;
     this.messagesOnAccount = 0;
+
+    // Scheduled rotation should not land on a token that already failed auth
+    // or needs verification. It would produce a pointless failed request and
+    // then rotate again on the next turn.
+    const now = Date.now();
+    for (let step = 1; step <= this.accounts.length; step += 1) {
+      const next = (this.index + step) % this.accounts.length;
+      if (!this._isQuarantined(this.accounts[next]?.token, now)) {
+        if (next === this.index) return null;
+        this.index = next;
+        return { from, to: this.index + 1, count: this.switchAfter };
+      }
+    }
+
+    // Every account is quarantined: keep the old round-robin behavior.
     this.index = (this.index + 1) % this.accounts.length;
     return { from, to: this.index + 1, count: this.switchAfter };
   }
@@ -198,12 +327,18 @@ export class TokenStore {
     if (Array.isArray(patch.accounts) && patch.accounts.length) {
       this._replaceAccounts(normalizeAccounts(patch.accounts));
     } else if (typeof patch.token === 'string' && patch.token) {
-      const current = this.accounts[this.index] || { token: '', cookies: '', hifLeim: '' };
+      const current = this.accounts[this.index] || {
+        token: '',
+        cookies: '',
+        hifLeim: '',
+        hifDliq: '',
+      };
       const updated = {
         ...current,
         token: patch.token,
         cookies: typeof patch.cookies === 'string' ? patch.cookies : current.cookies,
         hifLeim: typeof patch.hifLeim === 'string' ? patch.hifLeim : current.hifLeim,
+        hifDliq: typeof patch.hifDliq === 'string' ? patch.hifDliq : current.hifDliq,
       };
       const rest = this.accounts.filter((_, i) => i !== this.index);
       const list = normalizeAccounts([updated, ...rest]);
@@ -211,12 +346,29 @@ export class TokenStore {
       this.accounts = list;
       this.index = index >= 0 ? index : 0;
       this.messagesOnAccount = 0;
+      // A refreshed token/cookies may carry the result of the browser
+      // verification, so let the account be tried again immediately.
+      this._quarantine.delete(updated.token);
+      this._challenges.delete(updated.token);
     } else {
       if (typeof patch.cookies === 'string' && this.accounts[this.index]) {
         this.accounts[this.index] = { ...this.accounts[this.index], cookies: patch.cookies };
       }
       if (typeof patch.hifLeim === 'string' && this.accounts[this.index]) {
         this.accounts[this.index] = { ...this.accounts[this.index], hifLeim: patch.hifLeim };
+      }
+      if (typeof patch.hifDliq === 'string' && this.accounts[this.index]) {
+        this.accounts[this.index] = { ...this.accounts[this.index], hifDliq: patch.hifDliq };
+      }
+      const activeToken = this.accounts[this.index]?.token;
+      if (
+        activeToken &&
+        (typeof patch.cookies === 'string' ||
+          typeof patch.hifLeim === 'string' ||
+          typeof patch.hifDliq === 'string')
+      ) {
+        this._quarantine.delete(activeToken);
+        this._challenges.delete(activeToken);
       }
     }
 
@@ -236,15 +388,22 @@ export class TokenStore {
     this._readTokenFile();
     this._readConfig();
     const current = this.accounts[this.index] || null;
+    const challengedAccounts = [];
+    for (let i = 0; i < this.accounts.length; i += 1) {
+      if (this._isChallenged(this.accounts[i].token)) challengedAccounts.push(i + 1);
+    }
     return {
       hasToken: Boolean(current?.token),
       hasCookies: Boolean(current?.cookies),
       hasHifLeim: Boolean(current?.hifLeim),
+      hasHifDliq: Boolean(current?.hifDliq),
       tokenLength: current?.token.length || 0,
       accounts: this.accounts.length,
       activeAccount: this.accounts.length ? this.index + 1 : 0,
       switchAfter: this.switchAfter,
       messagesOnAccount: this.messagesOnAccount,
+      challengeRequired: this._isChallenged(current?.token),
+      challengedAccounts,
     };
   }
 }

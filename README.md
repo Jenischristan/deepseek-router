@@ -6,13 +6,15 @@ with the site's own WASM solver, and exposes standard `/v1/chat/completions`
 and `/v1/models` endpoints. Multiple accounts can be queued for automatic
 failover and scheduled rotation.
 
-No npm packages, no pip packages, and no required build step. An optional C
-launcher is described below.
+No npm packages, no pip packages. The default router has no required build
+step; the optional C launcher and Go Firefox-transport sidecar are described
+below.
 
 ## Requirements
 
 - Node.js 20.3+ (uses built-in `fetch`, `AbortSignal.any`)
 - Python 3.10+ (only for `scripts/get-token.py`)
+- Go 1.24+ (only to build the optional Firefox transport sidecar)
 - One or more logged-in DeepSeek accounts in Zen/Firefox profiles (see
   [Multiple accounts](#multiple-accounts-automatic-collection))
 
@@ -25,13 +27,13 @@ launcher is described below.
    ```
 
    This reads `userToken` from the profile's localStorage snapshot, plus
-   optional DeepSeek cookies and `hif_leim_cached`, and writes
-   `~/.config/deepseek-router/config.json` with mode `600`.
+   optional DeepSeek cookies and the `hif_leim_cached`/`hif_dliq_cached`
+   values, and writes `~/.config/deepseek-router/config.json` with mode `600`.
 
 ### Multiple accounts (automatic collection)
 
-You do not need to copy tokens, cookies, or `hifLeim` by hand. The extractor
-pulls all three from each browser profile/container automatically.
+You do not need to copy tokens, cookies, or `hifLeim`/`hifDliq` by hand. The
+extractor pulls all of them from each browser profile/container automatically.
 
 - Recommended for one browser: keep each account in its own Firefox/Zen
   container (Multi-Account Containers). Containers isolate cookies and
@@ -79,8 +81,8 @@ pulls all three from each browser profile/container automatically.
   ```
 
   Every new token it sees is appended to `accounts` together with that
-  profile's cookies and `hifLeim`. Press Ctrl+C when done. Existing accounts
-  are kept, so re-running only adds new ones.
+  profile's cookies, `hifLeim`, and `hifDliq`. Press Ctrl+C when done. Existing
+  accounts are kept, so re-running only adds new ones.
 
   To rotate the queue after a fixed number of model messages, set
   `accountSwitchAfter` in the config (for example `5`) or start the router with
@@ -111,23 +113,6 @@ pulls all three from each browser profile/container automatically.
    `deepseek-router start --foreground`, `deepseek-router stop`,
    `deepseek-router status`, `deepseek-router logs -n 200`.
 
-   ### TUI dashboard
-
-   An optional C++ dashboard built with [FTXUI](https://github.com/ArthurSonzogni/FTXUI)
-   shows accounts, runtime state and the live log in a single pane:
-
-   ```bash
-   make tui                      # build tui/deepseek-router-tui (needs system FTXUI)
-   make install-tui              # install it into ~/.local/bin
-
-   deepseek-router dashboard     # or: npm run dashboard
-   deepseek-router dashboard --port 9000 --interval 1 --lines 200
-   ```
-
-   Keys: `r` refresh, `+`/`-` change the poll interval, `c` clear the log view,
-   `q` quit. It reads `/health` plus the pid/log files, so no extra endpoint is
-   needed; point it elsewhere with `--url http://host:port`.
-
 3. Point any OpenAI client at it:
 
    ```text
@@ -153,6 +138,7 @@ deepseek-router --help
 deepseek-router                     # start in the background
 deepseek-router start --port 9000   # override port/host
 deepseek-router start --foreground  # attached, with live logs
+deepseek-router start --transport firefox  # use the Go sidecar
 deepseek-router logs -n 100         # recent background log lines
 deepseek-router status              # running? which pid?
 deepseek-router stop                # stop the background server
@@ -161,7 +147,6 @@ deepseek-router token:accounts      # --write-accounts
 deepseek-router token:watch         # --watch
 deepseek-router test                # node --test
 deepseek-router paths               # resolved paths and tools
-deepseek-router dashboard           # open the FTXUI dashboard
 ```
 
 `make install` symlinks the binary in this repository, so rebuilding updates
@@ -175,7 +160,8 @@ repository path as a fallback.
 - `GET /v1/models/:id`
 - `POST /v1/chat/completions` (streaming and non-streaming)
 - `POST /v1/token` — update the token (or `accounts` array) at runtime
-  (`{"token":"..."}`, `persist` defaults to true)
+  (`{"token":"..."}`, optional `cookies`/`hifLeim`/`hifDliq`, `persist`
+  defaults to true)
 - `POST /v1/sessions/clear` — drop cached upstream sessions
 - `GET /health` — status, active account, session count
 
@@ -305,10 +291,68 @@ interpret it. This is useful for observing what the model emits on its own.
    `chat.completion.chunk` events. `THINK` fragments become
    `reasoning_content`; `RESPONSE` fragments become `content`. Emulated tool
    calls are emitted as standard `tool_calls` deltas.
+5. Before every completion the client refreshes `x-hif-leim` from
+   `hif-leim.deepseek.com/query`, which returns a new value with
+   `x-hif-ttl: 600` (10 minutes). `x-hif-dliq` is sent from the configured
+   value by default because `hif-dliq.deepseek.com` is IPv6-only on some
+   networks. Set `hifDliqRefresh` to also refresh it from
+   `hif-dliq.deepseek.com/query`; the router then keeps both values fresh
+   before their TTL expires.
 
 Upstream requests are serialized (one at a time by default, with a small gap)
-and use browser-like headers. This is deliberate: it keeps traffic close to a
-normal web client and avoids hammering the web API.
+and use browser-like headers. `minIntervalMs` spaces chat turns, account
+failover attempts, uploads, and repair calls. The short session-create -> PoW ->
+completion chain for one turn is not delayed, because the PoW challenge is
+time-limited.
+
+### Browser fingerprint
+
+The router mirrors the headers the DeepSeek web client sends from Firefox:
+`user-agent`, `accept`, `accept-language`, `accept-encoding`, the PoW header,
+`x-hif-*`, the `x-client-*` headers, `authorization`, `content-type`,
+`origin`, `sec-gpc`, `referer`, the cookies, and `sec-fetch-*`, in the same
+order Firefox writes them for the client's `XMLHttpRequest` calls. Like the web
+client, it sends no `Priority` header. Cookies are copied from the browser
+profile verbatim (including `smidV2` and the AWS WAF `aws-waf-token`) in
+Firefox's cookie order. The hif requests use `sec-fetch-site: same-site` with
+the same client headers, but no `Authorization` or `Cookie` header, because the
+DeepSeek cookies are scoped to `chat.deepseek.com`.
+
+`acceptEncoding` defaults to the browser's `gzip, deflate, br, zstd`. Node's
+fetch handles gzip/deflate/br itself; the router decompresses zstd before the
+JSON/SSE parser sees it. On Node builds without zstd support the default falls
+back to `gzip, deflate, br`.
+
+By default, network-level fingerprints (HTTP/2 and TLS/JA3) still come from
+Node, not Firefox, so headers and cookies can match while transport metadata
+differs. The optional Firefox transport below replaces Node's HTTP/1.1/OpenSSL
+stack with a Firefox-impersonating HTTP/2 client.
+
+### Firefox transport (optional)
+
+Build the sidecar and enable it:
+
+```bash
+make transport
+DEEPSEEK_TRANSPORT=firefox npm start
+# or set "transport": "firefox" in config.json
+```
+
+The router starts `transport/deepseek-transport` on a random loopback port,
+passes it a random per-process key, and sends all chat and hif requests through
+it. The sidecar uses `bogdanfinn/tls-client` with a `firefox_159` profile
+derived from the bundled Firefox 148 profile, so it negotiates HTTP/2 and sends
+a Firefox-like TLS ClientHello, HTTP/2 SETTINGS, HTTP/2 priority frames, and
+header order. The derived profile drops the CBC/DHE cipher suites and finite-field DH
+groups that Firefox 149+ removed and matches the 224-byte ECH grease payload.
+It is not a general proxy: only `chat.deepseek.com`, `hif-leim.deepseek.com`,
+and `hif-dliq.deepseek.com` are accepted, and it exits when the router process
+disappears.
+
+This is wire-level Firefox impersonation, not a literal NSS build: the TLS stack
+is Go/uTLS rather than Mozilla NSS. Literal NSS/Gecko transport would require
+driving Zen/Firefox itself as a sidecar. The sidecar keeps response bodies
+compressed and lets the router decode them, so `acceptEncoding` still applies.
 
 ## Configuration
 
@@ -322,11 +366,13 @@ this directory), plus environment variables. Environment variables win. Set
 | `token` | `DEEPSEEK_TOKEN` | — | Bearer token from localStorage |
 | `tokenFile` | `DEEPSEEK_TOKEN_FILE` | — | File containing just the token |
 | `cookies` | `DEEPSEEK_COOKIES` | — | Optional `Cookie` header |
-| `hifLeim` | `DEEPSEEK_HIF_LEIM` | — | Optional `x-hif-leim` header |
+| `hifLeim` | `DEEPSEEK_HIF_LEIM` | — | Optional fallback `x-hif-leim`; the runtime value from `hif-leim.deepseek.com/query` is preferred |
+| `hifDliq` | `DEEPSEEK_HIF_DLIQ` | — | Optional fallback `x-hif-dliq`; used when the runtime refresh is disabled or fails |
+| `hifDliqRefresh` | `DEEPSEEK_HIF_DLIQ_REFRESH` | `false` | Also refresh `x-hif-dliq` from `hif-dliq.deepseek.com/query` (that host is IPv6-only on some networks) |
 | `apiKey` | `DEEPSEEK_ROUTER_KEY` | — | Require this key on `/v1/*` |
 | `host` | `HOST` | `127.0.0.1` | Listen address |
 | `port` | `PORT` | `8788` | Listen port |
-| `minIntervalMs` | `UPSTREAM_MIN_INTERVAL_MS` | `400` | Gap between upstream request starts |
+| `minIntervalMs` | `UPSTREAM_MIN_INTERVAL_MS` | `400` | Minimum gap between chat request starts, account failover attempts, uploads, and repairs |
 | `concurrency` | `UPSTREAM_CONCURRENCY` | `1` | Parallel upstream completions |
 | `sessionTtlMs` | `SESSION_TTL_MS` | `21600000` | Session cache lifetime (6h) |
 | `maxSessions` | `MAX_SESSIONS` | `500` | Session cache size |
@@ -338,11 +384,19 @@ this directory), plus environment variables. Environment variables win. Set
 | `requestTimeoutMs` | `REQUEST_TIMEOUT_MS` | `600000` | Per-request upstream timeout |
 | `clientVersion` | `DEEPSEEK_CLIENT_VERSION` | `2.7.0` | `x-client-version` header |
 | `locale` | `DEEPSEEK_LOCALE` | `en_US` | `x-client-locale` header |
-| `userAgent` | `DEEPSEEK_USER_AGENT` | Firefox UA | `user-agent` header |
+| `userAgent` | `DEEPSEEK_USER_AGENT` | Firefox 159 on Linux | `user-agent` header |
+| `acceptLanguage` | `DEEPSEEK_ACCEPT_LANGUAGE` | `en-US,en;q=0.9` | `accept-language` header |
+| `acceptEncoding` | `DEEPSEEK_ACCEPT_ENCODING` | `gzip, deflate, br, zstd` | `accept-encoding` header; zstd is decoded by the router |
+| `secGpc` | `DEEPSEEK_SEC_GPC` | `true` | Send `sec-gpc: 1` like Firefox with Global Privacy Control enabled |
+| `transport` | `DEEPSEEK_TRANSPORT` | `node` | `node` (built-in fetch) or `firefox` (Go sidecar) |
+| `transportBinary` | `DEEPSEEK_TRANSPORT_BINARY` | `transport/deepseek-transport` | Sidecar binary path |
+| `transportProfile` | `DEEPSEEK_TRANSPORT_PROFILE` | `firefox_159` | tls-client browser profile (`firefox_159`, `firefox_148`, ...) |
 | `wasmPath` | `SHA3_WASM` | `assets/sha3.wasm` | Path to the PoW solver wasm |
 | `logLevel` | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug` |
 
-See `config.example.json`.
+See `config.example.json`. `minIntervalMs`, `concurrency`, and
+`hifDliqRefresh` are read at startup; restart after changing them. Account
+changes and `accountSwitchAfter` are hot-reloaded.
 
 ### Multiple accounts
 
@@ -354,8 +408,8 @@ hand:
 {
   "accountSwitchAfter": 5,
   "accounts": [
-    { "token": "...", "cookies": "...", "hifLeim": "..." },
-    { "token": "...", "cookies": "...", "hifLeim": "..." }
+    { "token": "...", "cookies": "...", "hifLeim": "...", "hifDliq": "..." },
+    { "token": "...", "cookies": "...", "hifLeim": "...", "hifDliq": "..." }
   ]
 }
 ```
@@ -379,6 +433,26 @@ the router advances to the next account, removes that account's cached upstream
 sessions, and retries the request from the start. The queue wraps around, and
 each account is tried at most once per request. Scheduled rotation still applies
 on the new account. With a single `token`, behavior is unchanged.
+
+A token that fails with an auth error is quarantined for 10 minutes, so a dead
+token is not retried on every rotation cycle. Quarantine is cleared as soon as
+the account list changes (for example after re-syncing with
+`scripts/get-token.py --write-accounts`), and falls back to plain round-robin
+when every account is quarantined. Scheduled rotation also skips quarantined
+accounts, so an invalid token is not retried just because the message counter
+reached `accountSwitchAfter`.
+
+If DeepSeek answers with an interactive verification challenge
+(`CHALLENGE_REQUIRED`), the router does **not** try to solve or bypass it. The
+account is quarantined for 30 minutes and marked in `/health`, and the request
+immediately fails over to the next account. When no other account is available,
+the request fails with HTTP 403, `code: "challenge_required"`, and a short
+message such as `DeepSeek account 4 requires manual verification
+(captcha/challenge).` Open `https://chat.deepseek.com` in the same browser,
+complete the verification, then refresh the session with
+`python3 scripts/get-token.py --write-accounts`. Updating the account list,
+token, or cookies clears the quarantine. `/health` reports
+`challengeRequired` and the affected `challengedAccounts`.
 `DEEPSEEK_ACCOUNTS` accepts the same array as JSON; set
 `DEEPSEEK_ACCOUNT_SWITCH_AFTER` to change the rotation count without editing the
 config file.
@@ -460,7 +534,15 @@ python3 scripts/get-token.py --profile ~/.config/zen/<profile> --write
   logged in.
 - **`INVALID_POW_RESPONSE`** — should be retried automatically with a fresh
   challenge. If it persists, the client version or PoW format changed.
+- **`CHALLENGE_REQUIRED` / 403 `challenge_required`** — DeepSeek wants
+  interactive verification on that account. The router will not solve or
+  bypass it; it quarantines the account and continues with the next one.
+  Complete the check in the browser profile used by the extractor, then
+  refresh the token and cookies to clear the quarantine.
 - **Missing wasm** — ensure `assets/sha3.wasm` exists, or set `SHA3_WASM`.
+- **`hif-dliq` refresh fails with `network is unreachable`** — that host may
+  resolve only to IPv6. `hifDliqRefresh` defaults to `false`, so the configured
+  `hifDliq` value is still sent; enable it only on an IPv6-capable network.
 - **Port in use** — set `PORT`.
 - **No profiles found** — pass `--profile` with the directory that contains
   `prefs.js` and `storage/`.

@@ -9,10 +9,10 @@ npm test              # node --test (all tests)
 node --test test/tools.test.js   # one file
 make                  # build the optional C launcher
 make install          # symlink ./deepseek-router into ~/.local/bin
-make tui              # build tui/deepseek-router-tui (system FTXUI)
-make install-tui      # install the TUI into ~/.local/bin
+make transport        # build the optional Go Firefox transport sidecar
 node --check src/main.js         # syntax check (repeat per file)
 python3 -m py_compile scripts/get-token.py
+cd transport && go test ./...    # sidecar tests (local HTTP/2 upstream)
 ```
 
 No linter/formatter is configured. Keep the existing style: 2-space indent,
@@ -27,7 +27,10 @@ single quotes, trailing commas, ESM imports.
 | `src/daemon.js` | pid/log file handling for the background server |
 | `src/config.js` | `loadConfig` (env > file), `saveConfig`, `normalizeAccounts` |
 | `src/token.js` | `TokenStore`: account queue, rotation, config/token-file hot reload |
-| `src/deepseek.js` | Upstream client: sessions, PoW header, completion, retries |
+| `src/hif.js` | `HifStore`: fetches/refreshes `x-hif-leim`; optional `x-hif-dliq` refresh (off by default) |
+| `src/fetch.js` | `withZstd`: decodes `content-encoding: zstd`; default `accept-encoding` |
+| `src/transport.js` | Optional Firefox sidecar lifecycle + fetch wrapper (loopback, shared key, DeepSeek host allowlist) |
+| `src/deepseek.js` | Upstream client: sessions, PoW header, completion, retries; accepts `fetchImpl` |
 | `src/pow.js` | `PowSolver` driving `assets/sha3.wasm` |
 | `src/sessions.js` | `SessionStore` (TTL + LRU) and `conversationKey` |
 | `src/errors.js` | `HttpError`, `AuthError`, `UpstreamError`, `isPowError` |
@@ -43,8 +46,8 @@ single quotes, trailing commas, ESM imports.
 | `src/openai/prompt.js` | Tool instruction/signature/reminder building |
 | `src/openai/transcript.js` | Tool-call history and tool-result formatting, cache key normalization |
 | `src/openai/filter.js` | `ToolCallStreamFilter` and `splitAtToolMarker` |
-| `src/deepseek-router.c` | Optional launcher that `exec`s node/python |
-| `tui/dashboard.cpp` | FTXUI dashboard: polls `/health` via a forked node fetch, tails pid/log files |
+| `deepseek-router.c` | Optional launcher that `exec`s node/python |
+| `transport/main.go` | Loopback Go sidecar: `bogdanfinn/tls-client` Firefox TLS/HTTP2 forwarding, SSE streaming |
 | `scripts/get-token.py` | Browser-profile token/cookie extractor |
 
 ### Dependency order (openai modules)
@@ -63,6 +66,17 @@ Import from the lowest module that declares the symbol; avoid cycles (only
 - The pid/log files live in `~/.config/deepseek-router/`; `DEEPSEEK_ROUTER_FOREGROUND=1`
   is set by the detached child so the same code path serves both modes.
 - Config keys added to code must also be added to `README.md` and `config.example.json`.
+- The Firefox transport is opt-in (`transport: "firefox"` or `DEEPSEEK_TRANSPORT=firefox`);
+  keep `node` as the default and keep both sides' host allowlists in sync.
+- The sidecar keeps response bodies compressed (`DisableCompression`) so the
+  router can decode them; `withZstd` handles zstd, and Node fetch handles
+  gzip/deflate/br.
+- `hifDliqRefresh` is off by default because `hif-dliq.deepseek.com` is
+  IPv6-only on some networks; the static `hifDliq` value is still sent.
+- Upstream header order mirrors the web client's XHR wire order: PoW/hif before
+  `x-client-*`, `content-length` immediately before `origin`, and no
+  `priority`. Keep `browserHeaders`, `orderWithContentLength`, and the tests in
+  sync.
 
 ## Testing
 
@@ -71,5 +85,7 @@ Import from the lowest module that declares the symbol; avoid cycles (only
 `test/helpers.test.js` — config, `TokenStore`, `SessionStore`.
 `test/http.test.js` — HTTP routes and error paths (uses a fake client, no upstream).
 `test/sse.test.js` — patch-stream parsing and upstream error paths.
+`test/transport.test.js` — Firefox transport wrapper protocol (local fake sidecar).
+`transport/main_test.go` — sidecar allowlist, header order, HTTP/2 streaming, auth.
 
 There is no `typecheck` step; ESM + `node --check` is the safety net.

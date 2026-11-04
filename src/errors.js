@@ -30,6 +30,28 @@ export class UpstreamError extends Error {
   }
 }
 
+// DeepSeek uses this for an account that has to be verified interactively in
+// the browser (captcha / challenge). It is not a transient upstream failure:
+// retrying it only burns the account, so callers must stop using the token.
+export class ChallengeError extends UpstreamError {
+  constructor(message = 'DeepSeek requires manual verification for this account') {
+    super(message, {
+      status: 403,
+      code: 'challenge_required',
+      type: 'permission_error',
+      retryable: false,
+    });
+    this.name = 'ChallengeError';
+  }
+}
+
+const CHALLENGE_PATTERN =
+  /(?:challenge[_ -]?required|captcha|verification[_ -]?required|verify (?:your )?(?:account|identity|human))/i;
+
+export function isChallengeMessage(value) {
+  return typeof value === 'string' && CHALLENGE_PATTERN.test(value);
+}
+
 export function isPowError(code) {
   return [40300, 40301, 40303, 40304].includes(Number(code));
 }

@@ -1,4 +1,12 @@
-import { AuthError, UpstreamError, isPowError } from './errors.js';
+import {
+  AuthError,
+  ChallengeError,
+  UpstreamError,
+  isChallengeMessage,
+  isPowError,
+} from './errors.js';
+import { DEFAULT_ACCEPT_ENCODING, withZstd } from './fetch.js';
+import { HifStore } from './hif.js';
 
 const BASE = 'https://chat.deepseek.com';
 const COMPLETION_PATH = '/api/v0/chat/completion';
@@ -6,48 +14,145 @@ const UPLOAD_PATH = '/api/v0/file/upload_file';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function clientHeaders(cfg) {
+  return {
+    'x-client-bundle-id': 'com.deepseek.chat',
+    'x-client-platform': 'web',
+    'x-client-version': cfg.clientVersion,
+    'x-client-locale': cfg.locale,
+    'x-client-timezone-offset': String(-new Date().getTimezoneOffset() * 60),
+  };
+}
+
+// The real web client uses XMLHttpRequest. Firefox writes the standard
+// browser headers first, then author headers in insertion order, then
+// content-type/content-length, origin, GPC, referer, cookies, and sec-fetch-*.
+// Keep this object in that order; the transport sidecar forwards the order
+// hint.
+function browserHeaders(
+  cfg,
+  {
+    site = 'same-origin',
+    contentType = '',
+    authorization = '',
+    cookie = '',
+    hifLeim = '',
+    hifDliq = '',
+    extraHeaders = {},
+  } = {},
+) {
+  const headers = {
+    'user-agent': cfg.userAgent,
+    accept: '*/*',
+    'accept-language': cfg.acceptLanguage || 'en-US,en;q=0.9',
+    'accept-encoding': cfg.acceptEncoding || DEFAULT_ACCEPT_ENCODING,
+  };
+  Object.assign(headers, extraHeaders);
+  if (hifLeim) headers['x-hif-leim'] = hifLeim;
+  if (hifDliq) headers['x-hif-dliq'] = hifDliq;
+  Object.assign(headers, clientHeaders(cfg));
+  if (authorization) headers.authorization = authorization;
+  if (contentType) headers['content-type'] = contentType;
+  headers.origin = BASE;
+  if (cfg.secGpc !== false) headers['sec-gpc'] = '1';
+  headers.referer = `${BASE}/`;
+  if (cookie) headers.cookie = cookie;
+  headers['sec-fetch-dest'] = 'empty';
+  headers['sec-fetch-mode'] = 'cors';
+  headers['sec-fetch-site'] = site;
+  return headers;
+}
+
+function challengeMessage(json, text = '') {
+  const candidates = [
+    json?.msg,
+    json?.message,
+    json?.data?.biz_msg,
+    json?.data?.message,
+    json?.data?.biz_data?.msg,
+  ];
+  for (const candidate of candidates) {
+    if (isChallengeMessage(candidate)) return String(candidate);
+  }
+  if (isChallengeMessage(text)) return 'DeepSeek requires manual verification';
+  return null;
+}
+
+function throwIfChallenge(json, text = '') {
+  const message = challengeMessage(json, text);
+  if (message) throw new ChallengeError(message);
+}
+
 export class DeepSeekClient {
-  constructor({ tokenStore, solver, config }) {
+  constructor({ tokenStore, solver, config, hif, fetchImpl = fetch }) {
     this.tokenStore = tokenStore;
     this.solver = solver;
     this.cfg = config;
+    this.fetch = withZstd(fetchImpl);
+    // `hif: null` disables the runtime fetch (tests, or when the user wants
+    // the old static x-hif-leim behavior).
+    this.hif =
+      hif === undefined
+        ? new HifStore({
+            fetchImpl: this.fetch,
+            refreshDliq: this.cfg.hifDliqRefresh === true,
+          })
+        : hif;
   }
 
-  async _headers(account, extra = {}) {
+  async _headers(account, extra = {}, { hif = false } = {}) {
     const active = account ?? this.tokenStore.current();
     const token = active?.token || '';
     if (!token) throw new AuthError('No DeepSeek token configured');
 
-    const headers = {
+    let hifLeim = '';
+    let hifDliq = '';
+
+    // The web client only adds hif headers to the SSE completion request
+    // (`addSSEHeader`), and refreshes them from hif-*.deepseek.com/query
+    // before the 10-minute TTL expires. A stale log-in snapshot is one of
+    // the strongest "unofficial client" signals.
+    if (hif) {
+      hifLeim = active?.hifLeim || '';
+      hifDliq = active?.hifDliq || '';
+
+      if (this.hif) {
+        let values = null;
+        try {
+          values = await this.hif.get(
+            active,
+            // hif-*.deepseek.com is a different origin but the same site.
+            // The web client's global request hook adds the x-client headers
+            // to these polls too, and the browser sends no DeepSeek cookies
+            // because they are scoped to chat.deepseek.com.
+            browserHeaders(this.cfg, { site: 'same-site' }),
+          );
+        } catch {
+          // A hif outage must not fail the completion; fall back to the
+          // configured static value, if any.
+        }
+        if (values?.leim) hifLeim = values.leim;
+        if (values?.dliq) hifDliq = values.dliq;
+      }
+    }
+
+    return browserHeaders(this.cfg, {
+      site: 'same-origin',
+      contentType: 'application/json',
       authorization: `Bearer ${token}`,
-      'content-type': 'application/json',
-      accept: '*/*',
-      'accept-language': 'en-US,en;q=0.9',
-      origin: BASE,
-      referer: `${BASE}/`,
-      'user-agent': this.cfg.userAgent,
-      'x-client-bundle-id': 'com.deepseek.chat',
-      'x-client-platform': 'web',
-      'x-client-version': this.cfg.clientVersion,
-      'x-client-locale': this.cfg.locale,
-      'x-client-timezone-offset': String(-new Date().getTimezoneOffset() * 60),
-      'sec-fetch-site': 'same-origin',
-      'sec-fetch-mode': 'cors',
-      'sec-fetch-dest': 'empty',
-    };
-
-    if (active?.cookies) headers.cookie = active.cookies;
-    if (active?.hifLeim) headers['x-hif-leim'] = active.hifLeim;
-
-    return { ...headers, ...extra };
+      cookie: active?.cookies || '',
+      hifLeim,
+      hifDliq,
+      extraHeaders: extra,
+    });
   }
 
-  async _fetch(path, { body, extraHeaders, signal, account } = {}) {
-    const headers = await this._headers(account, extraHeaders);
+  async _fetch(path, { body, extraHeaders, signal, account, hif = false } = {}) {
+    const headers = await this._headers(account, extraHeaders, { hif });
     const timeout = AbortSignal.timeout(this.cfg.requestTimeoutMs);
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
 
-    return fetch(BASE + path, {
+    return this.fetch(BASE + path, {
       method: 'POST',
       headers,
       body: body ?? '{}',
@@ -74,6 +179,8 @@ export class DeepSeekClient {
         } catch {
           // ignore
         }
+
+        throwIfChallenge(json, text);
 
         if (response.status === 401) throw new AuthError();
         if (json && [40002, 40003].includes(json.code)) throw new AuthError(json.msg);
@@ -111,6 +218,8 @@ export class DeepSeekClient {
     } catch {
       // ignore
     }
+
+    throwIfChallenge(json, text);
 
     if (response.status === 401 || (json && [40002, 40003].includes(json.code))) {
       throw new AuthError(json?.msg);
@@ -161,7 +270,7 @@ export class DeepSeekClient {
 
         const timeout = AbortSignal.timeout(this.cfg.requestTimeoutMs);
         const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
-        const response = await fetch(BASE + UPLOAD_PATH, {
+        const response = await this.fetch(BASE + UPLOAD_PATH, {
           method: 'POST',
           headers,
           body: form,
@@ -175,6 +284,8 @@ export class DeepSeekClient {
         } catch {
           // ignore
         }
+
+        throwIfChallenge(json, text);
 
         const bizCode = json?.data?.biz_code;
         if (json && isPowError(bizCode) && attempt < 2) {
@@ -261,6 +372,7 @@ export class DeepSeekClient {
           extraHeaders: { 'x-ds-pow-response': powHeader },
           signal,
           account,
+          hif: true,
         });
 
         const contentType = response.headers.get('content-type') || '';
@@ -274,6 +386,8 @@ export class DeepSeekClient {
         } catch {
           // ignore
         }
+
+        throwIfChallenge(json, text);
 
         if (json && isPowError(json.code) && attempt < 2) {
           lastError = new UpstreamError(json.msg || 'Invalid PoW response', {

@@ -14,11 +14,8 @@ BINDIR ?= $(PREFIX)/bin
 
 all: deepseek-router
 
-tui:
-	$(MAKE) -C tui
-
-install-tui: tui
-	$(MAKE) -C tui install
+transport:
+	cd transport && go build -trimpath -ldflags='-s -w' -o deepseek-transport .
 
 deepseek-router: deepseek-router.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LDFLAGS)
@@ -32,7 +29,6 @@ uninstall:
 	rm -f "$(BINDIR)/deepseek-router"
 
 clean:
-	rm -f deepseek-router
-	-$(MAKE) -C tui clean
+	rm -f deepseek-router transport/deepseek-transport
 
-.PHONY: all install uninstall clean tui install-tui
+.PHONY: all install uninstall clean transport

@@ -7,6 +7,7 @@ import { MODELS } from './server.js';
 import { PowSolver } from './pow.js';
 import { createServer } from './server.js';
 import { TokenStore } from './token.js';
+import { startTransport } from './transport.js';
 
 export async function runForeground() {
   const config = loadConfig();
@@ -25,8 +26,21 @@ export async function runForeground() {
     process.exit(1);
   }
 
+  let transport;
+  try {
+    transport = await startTransport(config);
+  } catch (error) {
+    console.error(`Failed to start transport: ${error.message}`);
+    process.exit(1);
+  }
+
   const tokenStore = new TokenStore(config);
-  const client = new DeepSeekClient({ tokenStore, solver, config });
+  const client = new DeepSeekClient({
+    tokenStore,
+    solver,
+    config,
+    fetchImpl: transport?.fetch,
+  });
   const server = createServer({ config, tokenStore, client });
 
   server.on('error', (error) => {
@@ -52,6 +66,9 @@ export async function runForeground() {
   );
   console.log(`  auth:   ${config.apiKey ? 'enabled (API key required)' : 'disabled'}`);
   console.log(`  models: ${MODELS.map((model) => model.id).join(', ')}`);
+  console.log(
+    `  transport: ${transport ? `firefox sidecar (${config.transportProfile})` : 'node fetch'}`,
+  );
   console.log(`  upstream: serialized, min interval ${config.minIntervalMs}ms`);
 
   let closing = false;
@@ -59,8 +76,11 @@ export async function runForeground() {
     if (closing) return;
     closing = true;
     console.log(`\nReceived ${signal}, shutting down...`);
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 2000).unref();
+    server.close(async () => {
+      await transport?.close();
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(0), 5000).unref();
   }
 
   process.on('SIGINT', () => shutdown('SIGINT'));

@@ -1,7 +1,45 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { ChallengeError } from '../src/errors.js';
 import { createServer } from '../src/server.js';
+import { TokenStore } from '../src/token.js';
+
+function tokenStore(tokens) {
+  return new TokenStore({
+    accounts: tokens.map((token) => ({ token })),
+    configFile: null,
+  });
+}
+
+function sseResponse(content) {
+  const ready = {
+    request_message_id: 'req-1',
+    response_message_id: 'msg-1',
+    model_type: 'default',
+  };
+  const update = {
+    v: {
+      response: {
+        message_id: 'msg-1',
+        status: 'FINISHED',
+        accumulated_token_usage: 1,
+        fragments: [{ type: 'RESPONSE', content }],
+      },
+    },
+  };
+  return new Response(
+    [
+      'event: ready',
+      `data: ${JSON.stringify(ready)}`,
+      '',
+      `data: ${JSON.stringify(update)}`,
+      '',
+      '',
+    ].join('\n'),
+    { status: 200, headers: { 'content-type': 'text/event-stream' } },
+  );
+}
 
 function fakeTokenStore() {
   const account = { token: 'test-token' };
@@ -15,8 +53,8 @@ function fakeTokenStore() {
   };
 }
 
-async function withServer(fn, overrides = {}) {
-  const client = {
+async function withServer(fn, overrides = {}, options = {}) {
+  const client = options.client ?? {
     createSession: async () => 'session-1',
     completion: async () => {
       throw new Error('completion should not be reached');
@@ -33,7 +71,11 @@ async function withServer(fn, overrides = {}) {
     parseToolCalls: true,
     ...overrides,
   };
-  const server = createServer({ config, tokenStore: fakeTokenStore(), client });
+  const server = createServer({
+    config,
+    tokenStore: options.tokenStore ?? fakeTokenStore(),
+    client,
+  });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address();
   try {
@@ -162,6 +204,69 @@ test('POST /v1/chat/completions returns 404 for an unknown model', async () => {
   });
 });
 
+test('an interactive challenge marks the account and fails over to the next one', async () => {
+  const store = tokenStore(['a', 'b']);
+  const calls = [];
+  const client = {
+    createSession: async ({ account }) => `session-${account.token}`,
+    completion: async ({ account }) => {
+      calls.push(account.token);
+      if (account.token === 'a') throw new ChallengeError('CHALLENGE_REQUIRED');
+      return sseResponse('hello from b');
+    },
+  };
+
+  await withServer(
+    async (base) => {
+      const first = await fetch(`${base}/v1/chat/completions`, completion());
+      assert.equal(first.status, 200);
+      assert.equal((await first.json()).choices[0].message.content, 'hello from b');
+      assert.deepEqual(calls, ['a', 'b']);
+      assert.equal(store.active, 1);
+      assert.equal(store.isChallenged('a'), true);
+      assert.equal(store.isChallenged('b'), false);
+
+      // The next request starts on b, not on the challenged account.
+      const second = await fetch(`${base}/v1/chat/completions`, completion());
+      assert.equal(second.status, 200);
+      assert.deepEqual(calls, ['a', 'b', 'b']);
+    },
+    {},
+    { client, tokenStore: store },
+  );
+});
+
+test('a request reports the short challenge message when every account is blocked', async () => {
+  const store = tokenStore(['a', 'b', 'c', 'd']);
+  store.index = 3;
+  for (const token of ['a', 'b', 'c', 'd']) store.markChallenge(token);
+  let completions = 0;
+  const client = {
+    createSession: async () => 'session-1',
+    completion: async () => {
+      completions += 1;
+      throw new Error('completion should not be reached');
+    },
+  };
+
+  await withServer(
+    async (base) => {
+      const res = await fetch(`${base}/v1/chat/completions`, completion());
+      assert.equal(res.status, 403);
+      const json = await res.json();
+      assert.equal(json.error.code, 'challenge_required');
+      assert.equal(json.error.type, 'permission_error');
+      assert.equal(
+        json.error.message,
+        'DeepSeek account 4 requires manual verification (captcha/challenge).',
+      );
+      assert.equal(completions, 0);
+    },
+    {},
+    { client, tokenStore: store },
+  );
+});
+
 test('unknown endpoints return a structured 404', async () => {
   await withServer(async (base) => {
     const res = await fetch(`${base}/v1/nope`);
@@ -216,4 +321,30 @@ test('POST /v1/token validates the payload', async () => {
     assert.equal(res.status, 400);
     assert.equal((await res.json()).error.param, 'token');
   });
+});
+
+test('POST /v1/token accepts hifDliq without persisting', async () => {
+  const store = new TokenStore({
+    accounts: [{ token: 'a' }],
+    configFile: null,
+  });
+  await withServer(
+    async (base) => {
+      const res = await fetch(`${base}/v1/token`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          token: 'a',
+          hifDliq: 'dliq-value',
+          persist: false,
+        }),
+      });
+      assert.equal(res.status, 200);
+      const json = await res.json();
+      assert.equal(json.hasHifDliq, true);
+      assert.equal(store.current().hifDliq, 'dliq-value');
+    },
+    {},
+    { tokenStore: store },
+  );
 });
