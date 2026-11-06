@@ -20,6 +20,8 @@ const ENV_KEYS = [
   'DEEPSEEK_HIF_LEIM',
   'DEEPSEEK_HIF_DLIQ',
   'DEEPSEEK_HIF_DLIQ_REFRESH',
+  'DEEPSEEK_HIF_REFRESH_ENABLED',
+  'DEEPSEEK_POW_CHALLENGE_ENABLED',
   'DEEPSEEK_ACCEPT_LANGUAGE',
   'DEEPSEEK_ACCEPT_ENCODING',
   'DEEPSEEK_SEC_GPC',
@@ -76,8 +78,25 @@ test('normalizeAccounts trims, dedupes and fills defaults', () => {
     null,
   ]);
   assert.deepEqual(accounts, [
-    { token: 'a', cookies: '', hifLeim: '', hifDliq: '' },
-    { token: 'b', cookies: 'c=1', hifLeim: '', hifDliq: '' },
+    { token: 'a', cookies: '', hifLeim: '', hifDliq: '', deviceId: '' },
+    { token: 'b', cookies: 'c=1', hifLeim: '', hifDliq: '', deviceId: '' },
+  ]);
+});
+
+test('normalizeAccounts keeps the per-account device id', () => {
+  const accounts = normalizeAccounts([
+    { token: 'a', deviceId: ' 797b22a1-3517-49da-bf8a-a223575bd916 ' },
+    { token: 'b', deviceId: 42 },
+  ]);
+  assert.deepEqual(accounts, [
+    {
+      token: 'a',
+      cookies: '',
+      hifLeim: '',
+      hifDliq: '',
+      deviceId: '797b22a1-3517-49da-bf8a-a223575bd916',
+    },
+    { token: 'b', cookies: '', hifLeim: '', hifDliq: '', deviceId: '' },
   ]);
 });
 
@@ -90,6 +109,8 @@ test('loadConfig reads new env overrides', () => {
       DEEPSEEK_USER_AGENT: 'test-agent',
       DEEPSEEK_HIF_DLIQ: 'env-dliq',
       DEEPSEEK_HIF_DLIQ_REFRESH: 'on',
+      DEEPSEEK_HIF_REFRESH_ENABLED: 'off',
+      DEEPSEEK_POW_CHALLENGE_ENABLED: 'off',
       DEEPSEEK_ACCEPT_LANGUAGE: 'de-DE,de;q=0.9',
       DEEPSEEK_ACCEPT_ENCODING: 'gzip, br',
       DEEPSEEK_SEC_GPC: 'off',
@@ -108,6 +129,8 @@ test('loadConfig reads new env overrides', () => {
       assert.equal(cfg.userAgent, 'test-agent');
       assert.equal(cfg.hifDliq, 'env-dliq');
       assert.equal(cfg.hifDliqRefresh, true);
+      assert.equal(cfg.hifRefreshEnabled, false);
+      assert.equal(cfg.powChallengeEnabled, false);
       assert.equal(cfg.acceptLanguage, 'de-DE,de;q=0.9');
       assert.equal(cfg.acceptEncoding, 'gzip, br');
       assert.equal(cfg.secGpc, false);
@@ -142,6 +165,8 @@ test('loadConfig defaults browser fingerprint settings', () => {
     assert.equal(cfg.acceptEncoding, DEFAULT_ACCEPT_ENCODING);
     assert.equal(cfg.secGpc, true);
     assert.equal(cfg.hifDliqRefresh, false);
+    assert.equal(cfg.hifRefreshEnabled, true);
+    assert.equal(cfg.powChallengeEnabled, true);
     assert.equal(cfg.requestDelaySeconds, null);
     assert.equal(cfg.toolResultDelaySeconds, null);
     assert.equal(cfg.toolResultSkipAfterSeconds, 8);
@@ -286,6 +311,8 @@ test('loadConfig reads pacing and rotation settings from the config file', () =>
       minIntervalMs: 4000,
       concurrency: 2,
       accountSwitchAfter: 15,
+      hifRefreshEnabled: false,
+      powChallengeEnabled: false,
     }),
   );
   try {
@@ -294,6 +321,8 @@ test('loadConfig reads pacing and rotation settings from the config file', () =>
       assert.equal(cfg.minIntervalMs, 4000);
       assert.equal(cfg.concurrency, 2);
       assert.equal(cfg.accountSwitchAfter, 15);
+      assert.equal(cfg.hifRefreshEnabled, false);
+      assert.equal(cfg.powChallengeEnabled, false);
     });
   } finally {
     fs.unlinkSync(file);

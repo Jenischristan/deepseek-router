@@ -48,13 +48,14 @@ export function normalizeAccounts(list) {
   for (const entry of list) {
     const account =
       typeof entry === 'string'
-        ? { token: entry.trim(), cookies: '', hifLeim: '', hifDliq: '' }
+        ? { token: entry.trim(), cookies: '', hifLeim: '', hifDliq: '', deviceId: '' }
         : entry && typeof entry === 'object'
           ? {
             token: typeof entry.token === 'string' ? entry.token.trim() : '',
             cookies: typeof entry.cookies === 'string' ? entry.cookies : '',
             hifLeim: typeof entry.hifLeim === 'string' ? entry.hifLeim : '',
             hifDliq: typeof entry.hifDliq === 'string' ? entry.hifDliq : '',
+            deviceId: typeof entry.deviceId === 'string' ? entry.deviceId.trim() : '',
           }
           : null;
 
@@ -100,6 +101,7 @@ export function loadConfig() {
     cookies: env.DEEPSEEK_COOKIES || file.cookies || '',
     hifLeim: env.DEEPSEEK_HIF_LEIM || file.hifLeim || '',
     hifDliq: env.DEEPSEEK_HIF_DLIQ || file.hifDliq || '',
+    deviceId: env.DEEPSEEK_DEVICE_ID || file.deviceId || '',
   };
 
   const fromEnv = envAccounts();
@@ -120,9 +122,24 @@ export function loadConfig() {
     cookies: accounts[0]?.cookies || '',
     hifLeim: accounts[0]?.hifLeim || '',
     hifDliq: accounts[0]?.hifDliq || '',
+    deviceId: accounts[0]?.deviceId || '',
     hifDliqRefresh: boolValue(
       env.DEEPSEEK_HIF_DLIQ_REFRESH ?? file.hifDliqRefresh,
       false,
+    ),
+    // Runtime refresh of x-hif-leim from hif-leim.deepseek.com/query. Turning
+    // this off keeps only the static configured hifLeim value and removes the
+    // extra poll request from the upstream traffic pattern.
+    hifRefreshEnabled: boolValue(
+      env.DEEPSEEK_HIF_REFRESH_ENABLED ?? file.hifRefreshEnabled,
+      true,
+    ),
+    // The PoW challenge request is the only extra POST before a completion.
+    // Turning it off skips /chat/create_pow_challenge and sends no
+    // x-ds-pow-response header (the old pre-PoW request shape).
+    powChallengeEnabled: boolValue(
+      env.DEEPSEEK_POW_CHALLENGE_ENABLED ?? file.powChallengeEnabled,
+      true,
     ),
     apiKey: env.DEEPSEEK_ROUTER_KEY || file.apiKey || '',
     host: env.HOST || file.host || '127.0.0.1',
@@ -142,6 +159,12 @@ export function loadConfig() {
         8,
     ),
     concurrency: Math.max(1, Number(env.UPSTREAM_CONCURRENCY ?? file.concurrency ?? 1)),
+    rateLimitCooldownSeconds: secondsValue(
+      env.DEEPSEEK_RATE_LIMIT_COOLDOWN_SECONDS ?? file.rateLimitCooldownSeconds ?? 60,
+    ),
+    rateLimitRetries: Number(
+      env.DEEPSEEK_RATE_LIMIT_RETRIES ?? file.rateLimitRetries ?? 1,
+    ),
     sessionTtlMs: Number(env.SESSION_TTL_MS ?? file.sessionTtlMs ?? 6 * 60 * 60 * 1000),
     maxSessions: Number(env.MAX_SESSIONS ?? file.maxSessions ?? 500),
     injectToolPrompt: boolValue(

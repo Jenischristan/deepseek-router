@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { ChallengeError } from '../src/errors.js';
+import { ChallengeError, UpstreamError } from '../src/errors.js';
 import { createServer } from '../src/server.js';
 import { TokenStore } from '../src/token.js';
 
@@ -232,6 +232,99 @@ test('an interactive challenge marks the account and fails over to the next one'
       assert.deepEqual(calls, ['a', 'b', 'b']);
     },
     {},
+    { client, tokenStore: store },
+  );
+});
+
+test('a rate limit pauses and retries the same account instead of rotating', async () => {
+  const store = tokenStore(['a', 'b']);
+  const calls = [];
+  let attempts = 0;
+  const client = {
+    createSession: async ({ account }) => `session-${account.token}`,
+    completion: async ({ account }) => {
+      calls.push(account.token);
+      attempts += 1;
+      if (attempts === 1) {
+        throw new UpstreamError('rate limited', {
+          status: 429,
+          retryable: true,
+          retryAfterMs: 5,
+        });
+      }
+      return sseResponse('hello after pause');
+    },
+  };
+
+  await withServer(
+    async (base) => {
+      const res = await fetch(`${base}/v1/chat/completions`, completion());
+      assert.equal(res.status, 200);
+      assert.equal((await res.json()).choices[0].message.content, 'hello after pause');
+      assert.deepEqual(calls, ['a', 'a']);
+      assert.equal(store.active, 0, 'the same account stays active');
+    },
+    { rateLimitRetries: 1, rateLimitCooldownSeconds: 0.01 },
+    { client, tokenStore: store },
+  );
+});
+
+test('an exhausted rate limit is returned without rotating the queue', async () => {
+  const store = tokenStore(['a', 'b']);
+  const calls = [];
+  const client = {
+    createSession: async ({ account }) => `session-${account.token}`,
+    completion: async ({ account }) => {
+      calls.push(account.token);
+      throw new UpstreamError('rate limited', {
+        status: 429,
+        retryable: true,
+        retryAfterMs: 1500,
+      });
+    },
+  };
+
+  await withServer(
+    async (base) => {
+      const res = await fetch(`${base}/v1/chat/completions`, completion());
+      assert.equal(res.status, 429);
+      assert.equal(res.headers.get('retry-after'), '2');
+      assert.deepEqual(calls, ['a'], 'a 429 does not burn the next account');
+      assert.equal(store.active, 0);
+    },
+    { rateLimitRetries: 0, rateLimitCooldownSeconds: 0.01 },
+    { client, tokenStore: store },
+  );
+});
+
+test('a 50006 biz code is handled as a rate limit, not an account failure', async () => {
+  const store = tokenStore(['a', 'b']);
+  const calls = [];
+  let attempts = 0;
+  const client = {
+    createSession: async ({ account }) => `session-${account.token}`,
+    completion: async ({ account }) => {
+      calls.push(account.token);
+      attempts += 1;
+      if (attempts === 1) {
+        throw new UpstreamError('Messages too frequent', {
+          status: 429,
+          code: 50006,
+          retryable: true,
+        });
+      }
+      return sseResponse('hello again');
+    },
+  };
+
+  await withServer(
+    async (base) => {
+      const res = await fetch(`${base}/v1/chat/completions`, completion());
+      assert.equal(res.status, 200);
+      assert.deepEqual(calls, ['a', 'a']);
+      assert.equal(store.active, 0);
+    },
+    { rateLimitRetries: 1, rateLimitCooldownSeconds: 0.01 },
     { client, tokenStore: store },
   );
 });

@@ -20,13 +20,17 @@ export class AuthError extends Error {
 }
 
 export class UpstreamError extends Error {
-  constructor(message, { status = 502, code = null, type = 'upstream_error', retryable = false } = {}) {
+  constructor(
+    message,
+    { status = 502, code = null, type = 'upstream_error', retryable = false, retryAfterMs = null } = {},
+  ) {
     super(message);
     this.name = 'UpstreamError';
     this.status = status;
     this.code = code;
     this.type = type;
     this.retryable = retryable;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 

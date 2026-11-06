@@ -12,18 +12,20 @@ import { startTransport } from './transport.js';
 export async function runForeground() {
   const config = loadConfig();
 
-  if (!fs.existsSync(config.wasmPath)) {
-    console.error(`Missing PoW solver wasm: ${config.wasmPath}`);
-    console.error('Copy the DeepSeek sha3 wasm to assets/sha3.wasm or set SHA3_WASM.');
-    process.exit(1);
-  }
+  let solver = null;
+  if (config.powChallengeEnabled !== false) {
+    if (!fs.existsSync(config.wasmPath)) {
+      console.error(`Missing PoW solver wasm: ${config.wasmPath}`);
+      console.error('Copy the DeepSeek sha3 wasm to assets/sha3.wasm or set SHA3_WASM.');
+      process.exit(1);
+    }
 
-  let solver;
-  try {
-    solver = new PowSolver(config.wasmPath);
-  } catch (error) {
-    console.error(`Failed to initialize PoW solver: ${error.message}`);
-    process.exit(1);
+    try {
+      solver = new PowSolver(config.wasmPath);
+    } catch (error) {
+      console.error(`Failed to initialize PoW solver: ${error.message}`);
+      process.exit(1);
+    }
   }
 
   let transport;
@@ -77,6 +79,11 @@ export async function runForeground() {
     }`,
   );
   console.log(
+    `  extras:   pow challenge ${
+      config.powChallengeEnabled === false ? 'disabled' : 'enabled'
+    }, hif refresh ${config.hifRefreshEnabled === false ? 'disabled' : 'enabled'}`,
+  );
+  console.log(
     `  tool cooldown: ${
       config.toolResultDelaySeconds != null && config.toolResultDelaySeconds > 0
         ? `${config.toolResultDelaySeconds}s base (` +
@@ -86,6 +93,46 @@ export async function runForeground() {
         : 'disabled'
     }`,
   );
+
+  // Flag settings that make the router look less like a browser session and
+  // more like an account farm. These are warnings only; the user can still
+  // opt into them deliberately.
+  if (!transport) {
+    console.warn(
+      'warning: transport=node uses Node HTTP/1.1 + OpenSSL, not Firefox HTTP/2/TLS; use transport=firefox unless you have a reason not to.',
+    );
+  }
+  if (config.accountSwitchAfter > 0 && tokenStore.count > 1) {
+    console.warn(
+      `warning: accountSwitchAfter=${config.accountSwitchAfter} rotates accounts every ${config.accountSwitchAfter} messages; this is a strong multi-account abuse signal. Prefer 0.`,
+    );
+  }
+  if (
+    config.requestDelaySeconds != null &&
+    Number(config.requestDelaySeconds) >= 0 &&
+    Number(config.requestDelaySeconds) < 4
+  ) {
+    console.warn(
+      `warning: requestDelaySeconds=${config.requestDelaySeconds} is faster than a human web session; DeepSeek may rate-limit or challenge the account.`,
+    );
+  }
+  tokenStore.accounts.forEach((account, index) => {
+    if (!/(?:^|;\s*)aws-waf-token=/.test(account.cookies || '')) {
+      console.warn(
+        `warning: account ${index + 1} has no aws-waf-token cookie; DeepSeek may require captcha verification. Re-run scripts/get-token.py --write-accounts while logged in.`,
+      );
+    }
+    if (!account.deviceId) {
+      console.warn(
+        `warning: account ${index + 1} has no DeepSeek device id; requests will omit x-device-id. Re-run scripts/get-token.py --write-accounts while logged in.`,
+      );
+    }
+    if (!account.hifDliq) {
+      console.warn(
+        `warning: account ${index + 1} has no hifDliq value; its completion request will omit x-hif-dliq.`,
+      );
+    }
+  });
 
   let closing = false;
   function shutdown(signal) {

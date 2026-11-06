@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { ChallengeError, UpstreamError } from '../src/errors.js';
 import { DeepSeekClient } from '../src/deepseek.js';
 import { DEFAULT_ACCEPT_ENCODING } from '../src/fetch.js';
 import { HifStore } from '../src/hif.js';
@@ -418,4 +419,177 @@ test('DeepSeekClient: browser header settings are configurable', async () => {
   assert.equal(headers['accept-language'], 'de-DE,de;q=0.9');
   assert.equal(headers['accept-encoding'], 'gzip, br');
   assert.equal(headers['sec-gpc'], undefined);
+});
+
+test('DeepSeekClient: WAF challenge headers are reported without retrying', async () => {
+  const cases = [
+    [405, { 'x-amzn-waf-action': 'captcha' }],
+    [202, { 'x-amzn-waf-action': 'challenge' }],
+    [403, { 'cf-mitigated': 'challenge' }],
+    [429, { 'cf-mitigated': 'challenge' }],
+  ];
+
+  for (const [status, extraHeaders] of cases) {
+    let calls = 0;
+    const c = new DeepSeekClient({
+      tokenStore: { current: () => ACCOUNT },
+      solver: {},
+      config: {
+        userAgent: 'test-agent',
+        clientVersion: '2.7.0',
+        locale: 'en_US',
+        requestTimeoutMs: 5000,
+      },
+      fetchImpl: async () => {
+        calls += 1;
+        return new Response('', { status, headers: extraHeaders });
+      },
+    });
+
+    await assert.rejects(
+      c.createSession({}),
+      ChallengeError,
+      `HTTP ${status} + ${JSON.stringify(extraHeaders)} should be a challenge`,
+    );
+    assert.equal(calls, 1, 'a challenge must not be retried');
+  }
+});
+
+test('DeepSeekClient: createSession surfaces a 429 without retrying', async () => {
+  let calls = 0;
+  const c = new DeepSeekClient({
+    tokenStore: { current: () => ACCOUNT },
+    solver: {},
+    config: {
+      userAgent: 'test-agent',
+      clientVersion: '2.7.0',
+      locale: 'en_US',
+      requestTimeoutMs: 5000,
+    },
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ code: 50006, msg: 'slow down' }), {
+        status: 429,
+        headers: {
+          'content-type': 'application/json',
+          'retry-after': '7',
+        },
+      });
+    },
+  });
+
+  await assert.rejects(
+    c.createSession({}),
+    (error) =>
+      error instanceof UpstreamError &&
+      !(error instanceof ChallengeError) &&
+      error.status === 429 &&
+      error.retryAfterMs === 7000,
+  );
+  assert.equal(calls, 1, 'a rate limit must be paced by the request loop');
+});
+
+test('DeepSeekClient: an SSE-looking WAF challenge is detected before streaming', async () => {
+  let calls = 0;
+  const c = new DeepSeekClient({
+    tokenStore: { current: () => ACCOUNT },
+    solver: { solve: () => 'answer' },
+    hif: null,
+    config: {
+      userAgent: 'test-agent',
+      clientVersion: '2.7.0',
+      locale: 'en_US',
+      requestTimeoutMs: 5000,
+    },
+    fetchImpl: async (url) => {
+      calls += 1;
+      if (url.includes('create_pow_challenge')) {
+        return new Response(
+          JSON.stringify({
+            code: 0,
+            data: {
+              biz_data: {
+                challenge: {
+                  algorithm: 'sha3',
+                  challenge: 'c',
+                  salt: 's',
+                  signature: 'sig',
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response('event: ready\n\n', {
+        status: 202,
+        headers: {
+          'content-type': 'text/event-stream',
+          'x-amzn-waf-action': 'challenge',
+        },
+      });
+    },
+  });
+
+  await assert.rejects(
+    c.completion({ sessionId: 's', prompt: 'hi', thinking: false }),
+    ChallengeError,
+  );
+  assert.equal(calls, 2, 'the completion response was not parsed as a stream');
+});
+
+test('DeepSeekClient: powChallengeEnabled=false skips the challenge request', async () => {
+  const calls = [];
+  const c = new DeepSeekClient({
+    tokenStore: { current: () => ACCOUNT },
+    solver: {
+      solve: () => {
+        throw new Error('the solver must not run when PoW is disabled');
+      },
+    },
+    hif: null,
+    config: {
+      userAgent: 'test-agent',
+      clientVersion: '2.7.0',
+      locale: 'en_US',
+      requestTimeoutMs: 5000,
+      powChallengeEnabled: false,
+    },
+    fetchImpl: async (url, options) => {
+      calls.push({ url: String(url), headers: options.headers });
+      return new Response('event: ready\n\n', {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    },
+  });
+
+  const response = await c.completion({ sessionId: 's', prompt: 'hi' });
+  assert.equal(await response.text(), 'event: ready\n\n');
+  assert.equal(calls.length, 1, 'only the completion request is sent');
+  assert.ok(calls[0].url.endsWith('/api/v0/chat/completion'));
+  assert.equal(calls[0].headers['x-ds-pow-response'], undefined);
+});
+
+test('DeepSeekClient: hifRefreshEnabled=false keeps static values without polling', async () => {
+  let calls = 0;
+  const c = new DeepSeekClient({
+    tokenStore: { current: () => ACCOUNT },
+    solver: {},
+    config: {
+      userAgent: 'test-agent',
+      clientVersion: '2.7.0',
+      locale: 'en_US',
+      hifRefreshEnabled: false,
+    },
+    fetchImpl: async () => {
+      calls += 1;
+      return hifResponse('fresh-leim');
+    },
+  });
+
+  const headers = await c._headers(undefined, {}, { hif: true });
+  assert.equal(calls, 0, 'no hif-*.deepseek.com query is sent');
+  assert.equal(headers['x-hif-leim'], 'static-leim');
+  assert.equal(headers['x-hif-dliq'], 'static-dliq');
 });

@@ -3,18 +3,25 @@ import { configFilePath, normalizeAccounts, secondsValue } from './config.js';
 
 const RELOAD_INTERVAL_MS = 5000;
 // A token that returned an auth failure is skipped for this long before it is
-// tried again. Keeps a dead token from being retried on every rotation cycle,
-// while still letting a re-logged-in session be picked up after a cooldown.
-const QUARANTINE_MS = 10 * 60 * 1000;
+// tried again. Dead tokens used to be retried every ten minutes, which produced
+// hundreds of failed auth attempts per day and looked like credential stuffing.
+// A re-synced token/cookie set clears the quarantine immediately.
+const QUARANTINE_MS = 24 * 60 * 60 * 1000;
 // Interactive verification cannot be fixed by retrying. Keep the account out
 // of rotation long enough for the user to complete it in the browser.
-const CHALLENGE_QUARANTINE_MS = 30 * 60 * 1000;
+const CHALLENGE_QUARANTINE_MS = 24 * 60 * 60 * 1000;
 
 function accountsFromConfig(cfg) {
   const accounts = normalizeAccounts(cfg.accounts);
   if (accounts.length) return accounts;
   return normalizeAccounts([
-    { token: cfg.token, cookies: cfg.cookies, hifLeim: cfg.hifLeim, hifDliq: cfg.hifDliq },
+    {
+      token: cfg.token,
+      cookies: cfg.cookies,
+      hifLeim: cfg.hifLeim,
+      hifDliq: cfg.hifDliq,
+      deviceId: cfg.deviceId,
+    },
   ]);
 }
 
@@ -376,6 +383,7 @@ export class TokenStore {
         cookies: '',
         hifLeim: '',
         hifDliq: '',
+        deviceId: '',
       };
       const updated = {
         ...current,
@@ -383,6 +391,7 @@ export class TokenStore {
         cookies: typeof patch.cookies === 'string' ? patch.cookies : current.cookies,
         hifLeim: typeof patch.hifLeim === 'string' ? patch.hifLeim : current.hifLeim,
         hifDliq: typeof patch.hifDliq === 'string' ? patch.hifDliq : current.hifDliq,
+        deviceId: typeof patch.deviceId === 'string' ? patch.deviceId : current.deviceId,
       };
       const rest = this.accounts.filter((_, i) => i !== this.index);
       const list = normalizeAccounts([updated, ...rest]);
@@ -404,12 +413,16 @@ export class TokenStore {
       if (typeof patch.hifDliq === 'string' && this.accounts[this.index]) {
         this.accounts[this.index] = { ...this.accounts[this.index], hifDliq: patch.hifDliq };
       }
+      if (typeof patch.deviceId === 'string' && this.accounts[this.index]) {
+        this.accounts[this.index] = { ...this.accounts[this.index], deviceId: patch.deviceId };
+      }
       const activeToken = this.accounts[this.index]?.token;
       if (
         activeToken &&
         (typeof patch.cookies === 'string' ||
           typeof patch.hifLeim === 'string' ||
-          typeof patch.hifDliq === 'string')
+          typeof patch.hifDliq === 'string' ||
+          typeof patch.deviceId === 'string')
       ) {
         this._quarantine.delete(activeToken);
         this._challenges.delete(activeToken);

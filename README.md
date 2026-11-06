@@ -28,7 +28,13 @@ described below.
 
    This reads `userToken` from the profile's localStorage snapshot, plus
    optional DeepSeek cookies and the `hif_leim_cached`/`hif_dliq_cached`
-   values, and writes `~/.config/deepseek-router/config.json` with mode `600`.
+   values, validates the token against DeepSeek, and writes
+   `~/.config/deepseek-router/config.json` with mode `600`. Validation is a
+   single read-only `GET https://chat.deepseek.com/api/v0/users/settings`; dead
+   (`40002`/`40003`), rate-limited, or challenged tokens are not written. If the
+   check cannot reach DeepSeek, the command keeps the existing config instead of
+   deleting accounts. Use `--no-validate` only when you explicitly want an
+   offline extraction.
 
 ### Multiple accounts (automatic collection)
 
@@ -80,14 +86,18 @@ extractor pulls all of them from each browser profile/container automatically.
   # or: npm run token:watch
   ```
 
-  Every new token it sees is appended to `accounts` together with that
-  profile's cookies, `hifLeim`, and `hifDliq`. Press Ctrl+C when done. Existing
-  accounts are kept, so re-running only adds new ones.
+  Every new token it sees is validated first and only appended to `accounts`
+  if it is alive, together with that profile's cookies, `hifLeim`, and
+  `hifDliq`. Press Ctrl+C when done. Existing accounts are kept, so re-running
+  only adds new ones. The extractor also stores the profile's
+  `deepseek-device-id:chat` value as `deviceId`; the router sends it as
+  `x-device-id` so each account keeps the device identity its browser session
+  was created with.
 
-  To rotate the queue after a fixed number of model messages, set
-  `accountSwitchAfter` in the config (for example `5`) or start the router with
-  `DEEPSEEK_ACCOUNT_SWITCH_AFTER=5`. The next request moves to the next account
-  and the conversation is reseeded there. See
+  `accountSwitchAfter` is `0` (failover only) by default, which is the
+  recommended setting. Scheduled rotation across several accounts is a strong
+  multi-account abuse signal; only set it if you deliberately want to spread
+  messages across the queue. The router logs a warning when it is enabled. See
   [Multiple accounts](#multiple-accounts).
 
 2. Start the router:
@@ -301,14 +311,17 @@ interpret it. This is useful for observing what the model emits on its own.
    before their TTL expires.
 
 Upstream requests are serialized (one at a time by default, with a small gap)
-and use browser-like headers. `requestDelaySeconds` sets the wait before each
-new upstream request, in seconds: `0` disables the delay, `4` waits four
-seconds. It applies to chat turns, account failover attempts, uploads, and
-repair calls, and is hot-reloaded from `config.json`, so an edit applies to the
-next request without restarting. The first request after a router start is not
-delayed. If `requestDelaySeconds` is unset, `minIntervalMs` is used as the
-millisecond fallback. The short session-create -> PoW -> completion chain for
-one turn is not delayed, because the PoW challenge is time-limited.
+and use browser-like headers. `requestDelaySeconds` sets the average wait
+before each new upstream request, in seconds: `0` disables the delay, `4`
+waits about four seconds. Each gap is jittered by roughly +/-15% so repeated
+turns do not land on a metronomic cadence. It applies to chat turns, account
+failover attempts, uploads, and repair calls, and is hot-reloaded from
+`config.json`, so an edit applies to the next request without restarting. The
+first request after a router start is not delayed. If `requestDelaySeconds` is
+unset, `minIntervalMs` is used as the millisecond fallback. The short
+session-create -> PoW -> completion chain for one turn is not delayed, because
+the PoW challenge is time-limited. Values below four seconds are logged as a
+warning at startup.
 
 Tool loops get an extra cooldown. When a tool result comes back,
 `toolResultDelaySeconds` waits a randomly jittered fraction of that value
@@ -386,7 +399,10 @@ this directory), plus environment variables. Environment variables win. Set
 | `cookies` | `DEEPSEEK_COOKIES` | — | Optional `Cookie` header |
 | `hifLeim` | `DEEPSEEK_HIF_LEIM` | — | Optional fallback `x-hif-leim`; the runtime value from `hif-leim.deepseek.com/query` is preferred |
 | `hifDliq` | `DEEPSEEK_HIF_DLIQ` | — | Optional fallback `x-hif-dliq`; used when the runtime refresh is disabled or fails |
+| `deviceId` | `DEEPSEEK_DEVICE_ID` | — | Per-account `x-device-id` UUID from the browser's `deepseek-device-id:chat` localStorage entry; extract it with `get-token.py` so requests keep the account's device identity |
 | `hifDliqRefresh` | `DEEPSEEK_HIF_DLIQ_REFRESH` | `false` | Also refresh `x-hif-dliq` from `hif-dliq.deepseek.com/query` (that host is IPv6-only on some networks) |
+| `hifRefreshEnabled` | `DEEPSEEK_HIF_REFRESH_ENABLED` | `true` | Poll `hif-leim.deepseek.com/query` for a fresh `x-hif-leim`; `false` sends only the configured static value and drops the extra poll |
+| `powChallengeEnabled` | `DEEPSEEK_POW_CHALLENGE_ENABLED` | `true` | Request `/chat/create_pow_challenge` and send `x-ds-pow-response`. **Diagnostic only:** `false` skips both and DeepSeek rejects the completion with `MISSING_HEADER` (code `40300`) |
 | `apiKey` | `DEEPSEEK_ROUTER_KEY` | — | Require this key on `/v1/*` |
 | `host` | `HOST` | `127.0.0.1` | Listen address |
 | `port` | `PORT` | `8788` | Listen port |
@@ -395,13 +411,15 @@ this directory), plus environment variables. Environment variables win. Set
 | `toolResultDelaySeconds` | `DEEPSEEK_TOOL_RESULT_DELAY_SECONDS` | — | Base wait after a tool result before sending the follow-up; the actual wait is jittered to 70-95% of this value; `0` disables it; hot-reloaded |
 | `toolResultSkipAfterSeconds` | `DEEPSEEK_TOOL_RESULT_SKIP_AFTER_SECONDS` | `8` | Skip the tool-result cooldown when the tool already ran at least this long |
 | `concurrency` | `UPSTREAM_CONCURRENCY` | `1` | Parallel upstream completions |
+| `rateLimitCooldownSeconds` | `DEEPSEEK_RATE_LIMIT_COOLDOWN_SECONDS` | `60` | Pause before retrying the same account after a 429 when DeepSeek sends no `Retry-After` |
+| `rateLimitRetries` | `DEEPSEEK_RATE_LIMIT_RETRIES` | `1` | How many times to pause and retry the same account on a 429 (0-5); never rotates accounts |
 | `sessionTtlMs` | `SESSION_TTL_MS` | `21600000` | Session cache lifetime (6h) |
 | `maxSessions` | `MAX_SESSIONS` | `500` | Session cache size |
 | `injectToolPrompt` | `INJECT_TOOL_PROMPT` | `true` | Add the tool-use protocol to the prompt; `false` leaves tool parsing on but injects nothing |
 | `parseToolCalls` | `PARSE_TOOL_CALLS` | `true` | Convert DSML or JSON tool markup into `tool_calls`; `false` returns the raw text |
 | `repairToolCalls` | `REPAIR_TOOL_CALLS` | `true` | Ask the model to resend an unusable tool call instead of returning it broken |
 | `maxToolRepairs` | `MAX_TOOL_REPAIRS` | `2` | Maximum repair attempts per turn (clamped to 0-5) |
-| `accountSwitchAfter` | `DEEPSEEK_ACCOUNT_SWITCH_AFTER` | `0` | Rotate after N assistant messages per account (0 disables) |
+| `accountSwitchAfter` | `DEEPSEEK_ACCOUNT_SWITCH_AFTER` | `0` | Rotate after N assistant messages per account (0 disables; leave at 0 to avoid multi-account abuse signals) |
 | `requestTimeoutMs` | `REQUEST_TIMEOUT_MS` | `600000` | Per-request upstream timeout |
 | `clientVersion` | `DEEPSEEK_CLIENT_VERSION` | `2.7.0` | `x-client-version` header |
 | `locale` | `DEEPSEEK_LOCALE` | `en_US` | `x-client-locale` header |
@@ -415,10 +433,12 @@ this directory), plus environment variables. Environment variables win. Set
 | `wasmPath` | `SHA3_WASM` | `assets/sha3.wasm` | Path to the PoW solver wasm |
 | `logLevel` | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug` |
 
-See `config.example.json`. `minIntervalMs`, `concurrency`, and
-`hifDliqRefresh` are read at startup; restart after changing them. Account
-changes, `accountSwitchAfter`, `requestDelaySeconds`,
-`toolResultDelaySeconds`, and `toolResultSkipAfterSeconds` are hot-reloaded.
+See `config.example.json`. `minIntervalMs`, `concurrency`,
+`rateLimitCooldownSeconds`, `rateLimitRetries`, `hifDliqRefresh`,
+`hifRefreshEnabled`, and `powChallengeEnabled` are read at startup; restart
+after changing them. Account changes,
+`accountSwitchAfter`, `requestDelaySeconds`, `toolResultDelaySeconds`, and
+`toolResultSkipAfterSeconds` are hot-reloaded.
 
 ### Multiple accounts
 
@@ -428,10 +448,10 @@ hand:
 
 ```json
 {
-  "accountSwitchAfter": 5,
+  "accountSwitchAfter": 0,
   "accounts": [
-    { "token": "...", "cookies": "...", "hifLeim": "...", "hifDliq": "..." },
-    { "token": "...", "cookies": "...", "hifLeim": "...", "hifDliq": "..." }
+    { "token": "...", "cookies": "...", "hifLeim": "...", "hifDliq": "...", "deviceId": "..." },
+    { "token": "...", "cookies": "...", "hifLeim": "...", "hifDliq": "...", "deviceId": "..." }
   ]
 }
 ```
@@ -442,7 +462,9 @@ responses, the next request uses account 2 for five, then account 3, and so on.
 Tool-call turns count as model messages because they also consume upstream
 quota. The count is global across all conversations and tracks messages handled
 during the current stint on the active account. Set it to `0` (the default) to
-stay on the active account until it fails.
+stay on the active account until it fails. Failover still works with `0`;
+scheduled rotation is opt-in because it makes one browser session look like a
+pool of interchangeable accounts.
 
 Context is preserved across rotations. Each account has its own upstream
 session; when the active account changes, the router starts a fresh session on
@@ -450,13 +472,21 @@ the new account and seeds it with the full conversation transcript, including
 tool calls and tool results. Cached sessions are keyed by account, so a session
 from one account is never reused with another.
 
-If the active account fails with an auth error (401/403) or rate limit (429),
-the router advances to the next account, removes that account's cached upstream
-sessions, and retries the request from the start. The queue wraps around, and
-each account is tried at most once per request. Scheduled rotation still applies
-on the new account. With a single `token`, behavior is unchanged.
+If the active account fails with an auth error (401/403), the router advances
+to the next account, removes that account's cached upstream sessions, and
+retries the request from the start. The queue wraps around, and each account is
+tried at most once per request. Scheduled rotation still applies on the new
+account. With a single `token`, behavior is unchanged.
 
-A token that fails with an auth error is quarantined for 10 minutes, so a dead
+A `429` (or `50006`) is treated as global pacing pressure, not as a broken
+account: the router pauses for `Retry-After` when DeepSeek sends one,
+otherwise `rateLimitCooldownSeconds`, and retries the **same** account up to
+`rateLimitRetries` times. It does not rotate during a rate limit, because
+cycling the whole queue multiplies the request rate and looks like account
+farming. If retries are exhausted, the 429 is returned to the client with a
+`Retry-After` header.
+
+A token that fails with an auth error is quarantined for 24 hours, so a dead
 token is not retried on every rotation cycle. Quarantine is cleared as soon as
 the account list changes (for example after re-syncing with
 `scripts/get-token.py --write-accounts`), and falls back to plain round-robin
@@ -466,8 +496,11 @@ reached `accountSwitchAfter`.
 
 If DeepSeek answers with an interactive verification challenge
 (`CHALLENGE_REQUIRED`), the router does **not** try to solve or bypass it. The
-account is quarantined for 30 minutes and marked in `/health`, and the request
-immediately fails over to the next account. When no other account is available,
+account is quarantined for 24 hours and marked in `/health`, and the request
+immediately fails over to the next account. Challenge detection also recognizes
+the WAF response headers (`405` + `x-amzn-waf-action: captcha`, `202` +
+`x-amzn-waf-action: challenge`, and `403`/`429` + `cf-mitigated: challenge`)
+before parsing the body. When no other account is available,
 the request fails with HTTP 403, `code: "challenge_required"`, and a short
 message such as `DeepSeek account 4 requires manual verification
 (captcha/challenge).` Open `https://chat.deepseek.com` in the same browser,
@@ -495,14 +528,29 @@ account, `switchAfter`, and `messagesOnAccount`. When using `accounts`, run
 `--write` adds or updates one entry without removing the others. You can also
 send a new `accounts` array to `POST /v1/token`.
 
+`--write-accounts` validates each discovered token and rebuilds `accounts` from
+the live ones. A dead token (`40002`/`40003`, including an HTTP 200 response
+with a non-zero `code`), a rate-limited token, or one that needs a
+captcha/challenge is skipped. `--write` and `--watch` also validate the token
+they are about to add or update, but they do not prune accounts that are already
+in the config. If validation is `unknown` because the network, TLS, or DeepSeek
+returned a 5xx, `--write-accounts` leaves the config untouched rather than
+rewriting it without the account. If none of the discovered tokens is alive, it
+writes an empty `accounts` array and exits non-zero, so log in again in the
+browser before starting the router.
+
 Useful extractor flags:
 
 ```bash
 python3 scripts/get-token.py --list             # profiles/containers + token/hif presence
 python3 scripts/get-token.py --json             # full JSON (secret: do not share)
 python3 scripts/get-token.py --token-only       # print only the token
-python3 scripts/get-token.py --write-accounts   # all profiles/containers -> accounts array
-python3 scripts/get-token.py --watch            # capture accounts as you switch
+python3 scripts/get-token.py --write-accounts   # validated, alive profiles/containers -> accounts array
+python3 scripts/get-token.py --watch            # capture and validate accounts as you switch
+python3 scripts/get-token.py --validate         # validate even for --json / --token-only
+python3 scripts/get-token.py --alive-only       # print only alive tokens (implies --validate)
+python3 scripts/get-token.py --no-validate      # offline escape hatch; may write dead tokens
+python3 scripts/get-token.py --validation-timeout 30
 python3 scripts/get-token.py --profile ~/.config/zen/<profile> --write
 ```
 
@@ -553,9 +601,21 @@ python3 scripts/get-token.py --profile ~/.config/zen/<profile> --write
 ## Troubleshooting
 
 - **401 / invalid token** — rerun `python3 scripts/get-token.py --write` while
-  logged in.
+  logged in. The extractor validates the token before writing, so a successful
+  write means DeepSeek accepted it during that run.
+- **429 / `Messages too frequent`** — the router already pauses and retries the
+  same account. If it keeps happening, raise `requestDelaySeconds` (for example
+  to `8`), leave `concurrency` at `1`, and avoid `accountSwitchAfter`.
+- **Tokens disappear from the config after re-syncing** — the extractor only
+  keeps live tokens. Open `https://chat.deepseek.com` in the browser profile,
+  log in again (and complete any captcha), then rerun `--write-accounts`. If the
+  validation request itself could not reach DeepSeek, the command refuses to
+  rewrite the config.
 - **`INVALID_POW_RESPONSE`** — should be retried automatically with a fresh
-  challenge. If it persists, the client version or PoW format changed.
+  challenge. If it persists, the client version or PoW format changed. Do not
+  set `powChallengeEnabled: false` as a workaround: DeepSeek rejects PoW-less
+  completions with `MISSING_HEADER` (code `40300`), and the toggle exists only
+  for diagnostics.
 - **`CHALLENGE_REQUIRED` / 403 `challenge_required`** — DeepSeek wants
   interactive verification on that account. The router will not solve or
   bypass it; it quarantines the account and continues with the next one.
@@ -565,6 +625,17 @@ python3 scripts/get-token.py --profile ~/.config/zen/<profile> --write
 - **`hif-dliq` refresh fails with `network is unreachable`** — that host may
   resolve only to IPv6. `hifDliqRefresh` defaults to `false`, so the configured
   `hifDliq` value is still sent; enable it only on an IPv6-capable network.
+- **Session logged out / unusual-traffic warning after running the router** —
+  the strongest known causes are account rotation and replayed dead tokens, not
+  the hif or PoW requests. Keep `accountSwitchAfter` at `0`, keep one live
+  account in the config, re-sync after any logout, keep `concurrency` at `1`,
+  raise `requestDelaySeconds`, and avoid running the router and the website on
+  the same account at the same time. Do not disable `powChallengeEnabled`;
+  `hifRefreshEnabled: false` removes one poll but sends a static value that goes
+  stale. A headless real Firefox backend does not remove the two-client problem:
+  the site would still see the same account used from two clients, and
+  automating a logged-in Firefox profile is itself an additional bot signal.
+  See `docs/session-investigation.md` for the evidence.
 - **Port in use** — set `PORT`.
 - **No profiles found** — pass `--profile` with the directory that contains
   `prefs.js` and `storage/`.

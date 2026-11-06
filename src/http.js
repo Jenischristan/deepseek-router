@@ -83,6 +83,15 @@ class Gate {
     return this.minIntervalMs;
   }
 
+  // Fixed delays make every request land on the same metronomic cadence.
+  // Vary the gap by roughly +/-15% while keeping the configured value as the
+  // average; a zero delay stays zero.
+  effectiveDelayMs() {
+    const base = this.delayMs();
+    if (base <= 0) return 0;
+    return Math.round(base * (0.85 + Math.random() * 0.3));
+  }
+
   async acquire(signal) {
     if (signal?.aborted) throw new UpstreamError('Client closed request', { status: 499 });
 
@@ -105,7 +114,7 @@ class Gate {
     if (signal?.aborted) throw new UpstreamError('Client closed request', { status: 499 });
 
     this.active += 1;
-    const wait = this.lastStart + this.delayMs() - Date.now();
+    const wait = this.lastStart + this.effectiveDelayMs() - Date.now();
     if (wait > 0) await sleep(wait);
 
     if (signal?.aborted) {
@@ -118,7 +127,7 @@ class Gate {
 
   // Spacing for an extra upstream request made while the slot is already held.
   async pace(signal) {
-    const wait = this.lastStart + this.delayMs() - Date.now();
+    const wait = this.lastStart + this.effectiveDelayMs() - Date.now();
     if (wait > 0) await sleep(wait);
     if (signal?.aborted) throw new UpstreamError('Client closed request', { status: 499 });
     this.lastStart = Date.now();
@@ -235,6 +244,9 @@ function sendError(res, error) {
   const message = error.message || 'Internal server error';
 
   if (status === 401) res.setHeader('WWW-Authenticate', 'Bearer');
+  if (Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0) {
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil(error.retryAfterMs / 1000))));
+  }
 
   sendJson(
     res,
@@ -329,13 +341,9 @@ function isAccountFailure(error) {
   // ChallengeError is an UpstreamError with status 403, so this also rotates
   // past an account that needs a human.
   if (error instanceof AuthError) return true;
-  return (
-    error instanceof UpstreamError &&
-    (error.status === 401 ||
-      error.status === 403 ||
-      error.status === 429 ||
-      error.code === 50006)
-  );
+  // A 429 is a shared pacing signal, not a reason to burn another account.
+  // The request loop pauses and retries the same account instead.
+  return error instanceof UpstreamError && (error.status === 401 || error.status === 403);
 }
 
 // Walk past accounts that are waiting for a human. rotate() already skips
@@ -523,6 +531,8 @@ export function createServer({ config, tokenStore, client }) {
     }
     return secondsToMs(config.toolResultSkipAfterSeconds, 8000);
   };
+  const rateLimitRetries = clampInt(config.rateLimitRetries, 0, 5, 1);
+  const rateLimitCooldownMs = secondsToMs(config.rateLimitCooldownSeconds, 60_000);
 
   async function handleCompletion(req, res) {
     const startedAt = Date.now();
@@ -679,6 +689,7 @@ export function createServer({ config, tokenStore, client }) {
 
       const triedAccounts = new Set();
       const uploadedFiles = new Map();
+      let rateLimitRetriesLeft = rateLimitRetries;
 
       const uploadImages = async (images, account) => {
         const ids = [];
@@ -802,6 +813,29 @@ export function createServer({ config, tokenStore, client }) {
           // and continue with the next one instead of leaving the router
           // pinned to an account that will keep failing.
           if (challenge) tokenStore.markChallenge?.(account.token);
+
+          const rateLimited =
+            !challenge &&
+            error instanceof UpstreamError &&
+            (error.status === 429 || error.code === 429 || error.code === 50006);
+          if (rateLimited) {
+            if (rateLimitRetriesLeft > 0 && !controller.signal.aborted) {
+              rateLimitRetriesLeft -= 1;
+              const delay =
+                Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0
+                  ? error.retryAfterMs
+                  : rateLimitCooldownMs;
+              log.warn(
+                `upstream rate limit; pausing ${Math.ceil(delay / 1000)}s before retrying account ${failedAccount}`,
+              );
+              await sleepWithSignal(delay, controller.signal);
+              continue;
+            }
+            // A 429 is shared pacing pressure. Rotating to another account
+            // during it multiplies the request rate and looks like account
+            // farming, so surface it without burning the queue.
+            throw error;
+          }
 
           // Read the live count here: rotate() reloads the config, so the
           // account list can change while this request is in flight.
@@ -1338,6 +1372,7 @@ export function createServer({ config, tokenStore, client }) {
         if (typeof body.cookies === 'string') patch.cookies = body.cookies;
         if (typeof body.hifLeim === 'string') patch.hifLeim = body.hifLeim;
         if (typeof body.hifDliq === 'string') patch.hifDliq = body.hifDliq;
+        if (typeof body.deviceId === 'string') patch.deviceId = body.deviceId;
       }
 
       tokenStore.update(patch);

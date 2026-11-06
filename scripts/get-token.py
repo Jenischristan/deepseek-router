@@ -25,9 +25,12 @@ import os
 import re
 import shutil
 import sqlite3
+import ssl
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +49,33 @@ DEFAULT_CONTAINER_ICONS = {
     "cart": "Shopping",
 }
 
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64; rv:159.0) Gecko/20100101 Firefox/159.0"
+)
+DEFAULT_CLIENT_VERSION = "2.7.0"
+DEFAULT_LOCALE = "en_US"
+VALIDATION_URL = "https://chat.deepseek.com/api/v0/users/settings"
+DEVICE_ID_KEY = "deepseek-device-id:chat"
+AUTH_BIZ_CODES = {40002, 40003}
+RATE_LIMIT_CODES = {429, 50006}
+CHALLENGE_PATTERN = re.compile(
+    r"(?:challenge[_ -]?required|captcha|verification[_ -]?required|"
+    r"verify (?:your )?(?:account|identity|human)|requires manual verification)",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class ValidationResult:
+    status: str
+    reason: str = ""
+    http_status: int = 0
+    code: Optional[int] = None
+
+    @property
+    def alive(self) -> bool:
+        return self.status == "alive"
+
 
 @dataclass
 class Profile:
@@ -54,6 +84,7 @@ class Profile:
     token: Optional[str] = None
     hif_leim: Optional[str] = None
     hif_dliq: Optional[str] = None
+    device_id: Optional[str] = None
     ls_db: Optional[Path] = None
     active: bool = False
     mtime: float = 0.0
@@ -550,11 +581,14 @@ def analyze_profile(profile: Profile, tempdir: Path) -> list[Profile]:
 
         try:
             values = read_ls_keys(
-                db, ("userToken", "hif_leim_cached", "hif_dliq_cached"), tempdir
+                db,
+                ("userToken", "hif_leim_cached", "hif_dliq_cached", DEVICE_ID_KEY),
+                tempdir,
             )
             context.token = values.get("userToken")
             context.hif_leim = values.get("hif_leim_cached")
             context.hif_dliq = values.get("hif_dliq_cached")
+            context.device_id = values.get(DEVICE_ID_KEY)
         except Exception as exc:
             context.error = f"{db}: {exc}"
 
@@ -613,11 +647,26 @@ def account_details(
                 profile.path, tempdir, profile.user_context_id
             )
             profile.cookie_names = cookie_names
+            if "aws-waf-token" not in cookie_names:
+                print(
+                    f"warning: {profile.label} has no aws-waf-token cookie; "
+                    "DeepSeek may require captcha verification. Open the site, "
+                    "complete any challenge, and re-run.",
+                    file=sys.stderr,
+                )
         except Exception as exc:
             print(
                 f"warning: could not read cookies for {profile.label}: {exc}",
                 file=sys.stderr,
             )
+
+    if profile.token and not profile.device_id:
+        print(
+            f"warning: {profile.label} has no DeepSeek device id; "
+            "requests would omit x-device-id. Open chat.deepseek.com in that "
+            "profile so the site can store it, then re-run.",
+            file=sys.stderr,
+        )
 
     return {
         "profile": profile.label,
@@ -627,8 +676,174 @@ def account_details(
         "cookieNames": cookie_names,
         "hifLeim": (profile.hif_leim or "") if include_hif else "",
         "hifDliq": (profile.hif_dliq or "") if include_hif else "",
+        "deviceId": profile.device_id or "",
         "extractedAt": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def validation_headers(details: dict) -> dict[str, str]:
+    """Headers that match the router's normal browser-like request."""
+    offset = datetime.now().astimezone().utcoffset()
+    timezone_seconds = int(offset.total_seconds()) if offset is not None else 0
+    headers = {
+        "user-agent": os.environ.get("DEEPSEEK_USER_AGENT", DEFAULT_USER_AGENT),
+        "accept": "*/*",
+        "accept-language": os.environ.get(
+            "DEEPSEEK_ACCEPT_LANGUAGE", "en-US,en;q=0.9"
+        ),
+        "accept-encoding": "identity",
+        "x-client-bundle-id": "com.deepseek.chat",
+        "x-client-platform": "web",
+        "x-client-version": os.environ.get(
+            "DEEPSEEK_CLIENT_VERSION", DEFAULT_CLIENT_VERSION
+        ),
+        "x-client-locale": os.environ.get("DEEPSEEK_LOCALE", DEFAULT_LOCALE),
+        "x-client-timezone-offset": str(timezone_seconds),
+        "authorization": "Bearer " + details["token"],
+        "origin": "https://chat.deepseek.com",
+        "referer": "https://chat.deepseek.com/",
+        "sec-gpc": "1",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "connection": "close",
+    }
+    if details.get("cookies"):
+        headers["cookie"] = details["cookies"]
+    if details.get("deviceId"):
+        headers["x-device-id"] = details["deviceId"]
+        headers["x-device-model"] = ""
+    return headers
+
+
+def json_object(body: str) -> Optional[dict]:
+    try:
+        value = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def int_value(value) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
+        return int(value.strip())
+    return None
+
+
+def classify_validation(http_status: int, headers, body: str) -> ValidationResult:
+    lowered = (body or "").lower()
+    waf = str(headers.get("x-amzn-waf-action") or "").lower()
+    cf = str(headers.get("cf-mitigated") or "").lower()
+
+    challenge = (
+        (http_status == 405 and waf == "captcha")
+        or (http_status == 202 and waf == "challenge")
+        or (http_status in (403, 429) and cf == "challenge")
+        or bool(CHALLENGE_PATTERN.search(lowered))
+    )
+    if challenge:
+        return ValidationResult(
+            "challenged",
+            "DeepSeek wants a browser captcha/challenge; log in and re-sync",
+            http_status,
+        )
+
+    payload = json_object(body) or {}
+    code = int_value(payload.get("code"))
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    biz_code = int_value(data.get("biz_code"))
+    message = str(payload.get("msg") or payload.get("message") or "").strip()
+
+    if http_status in (401, 403):
+        return ValidationResult(
+            "dead", message or f"HTTP {http_status}", http_status, code
+        )
+    if http_status == 429 or code in RATE_LIMIT_CODES or biz_code in RATE_LIMIT_CODES:
+        return ValidationResult(
+            "rate_limited",
+            message or "DeepSeek rate limit reached; try again shortly",
+            http_status,
+            code,
+        )
+    if code in AUTH_BIZ_CODES or biz_code in AUTH_BIZ_CODES:
+        return ValidationResult(
+            "dead", message or "INVALID_TOKEN", http_status, code or biz_code
+        )
+    if 200 <= http_status < 300:
+        if code == 0 or biz_code == 0:
+            return ValidationResult("alive", "ok", http_status, code)
+        if code is not None or biz_code is not None:
+            return ValidationResult(
+                "dead",
+                message or f"biz_code {code if code is not None else biz_code}",
+                http_status,
+                code if code is not None else biz_code,
+            )
+        return ValidationResult(
+            "unknown",
+            "HTTP 200 but the response was not a JSON API reply",
+            http_status,
+        )
+    if http_status >= 500:
+        return ValidationResult(
+            "unknown", f"HTTP {http_status}", http_status, code
+        )
+    return ValidationResult(
+        "unknown",
+        message or f"HTTP {http_status}",
+        http_status,
+        code,
+    )
+
+
+def validate_account(details: dict, timeout: float) -> ValidationResult:
+    """Check whether DeepSeek still accepts this token/cookie pair.
+
+    /api/v0/users/settings is read-only, needs the bearer token, and returns
+    the same 40002/40003 codes as the chat endpoints when the session is dead.
+    A network or 5xx failure is reported as `unknown`, not `dead`, so a
+    transient outage never deletes a working account from the config.
+    """
+    request = urllib.request.Request(
+        VALIDATION_URL, headers=validation_headers(details), method="GET"
+    )
+    try:
+        with urllib.request.urlopen(
+            request, timeout=timeout, context=ssl.create_default_context()
+        ) as response:
+            body = response.read(64 * 1024).decode("utf-8", "replace")
+            return classify_validation(response.status, response.headers, body)
+    except urllib.error.HTTPError as error:
+        try:
+            body = error.read(64 * 1024).decode("utf-8", "replace")
+        except OSError:
+            body = ""
+        return classify_validation(error.code, error.headers, body)
+    except Exception as error:  # network, TLS, DNS, timeout
+        return ValidationResult("unknown", f"{type(error).__name__}: {error}")
+
+
+def attach_validation(details: dict, result: ValidationResult) -> dict:
+    enriched = dict(details)
+    enriched["alive"] = result.alive
+    enriched["validation"] = result.status
+    if result.reason:
+        enriched["validationReason"] = result.reason
+    return enriched
+
+
+def print_validation(details: dict, result: ValidationResult, quiet: bool) -> None:
+    if quiet:
+        return
+    detail = f" ({result.reason})" if result.reason and result.status != "alive" else ""
+    print(
+        f"validate {mask_token(details['token'])}: {result.status}{detail}",
+        file=sys.stderr,
+    )
 
 
 def config_account(details: dict) -> dict:
@@ -639,6 +854,8 @@ def config_account(details: dict) -> dict:
         account["hifLeim"] = details["hifLeim"]
     if details["hifDliq"]:
         account["hifDliq"] = details["hifDliq"]
+    if details.get("deviceId"):
+        account["deviceId"] = details["deviceId"]
     return account
 
 
@@ -741,6 +958,8 @@ def upsert_config_account(path: Path, account: dict) -> tuple[int, bool]:
                 legacy["hifLeim"] = current["hifLeim"]
             if isinstance(current.get("hifDliq"), str) and current["hifDliq"]:
                 legacy["hifDliq"] = current["hifDliq"]
+            if isinstance(current.get("deviceId"), str) and current["deviceId"]:
+                legacy["deviceId"] = current["deviceId"]
             normalized.append(legacy)
 
     index = next(
@@ -759,7 +978,7 @@ def upsert_config_account(path: Path, account: dict) -> tuple[int, bool]:
         changed = True
     else:
         existing = normalized[index]
-        for key in ("cookies", "hifLeim", "hifDliq"):
+        for key in ("cookies", "hifLeim", "hifDliq", "deviceId"):
             value = account.get(key)
             if value and existing.get(key) != value:
                 existing[key] = value
@@ -770,6 +989,7 @@ def upsert_config_account(path: Path, account: dict) -> tuple[int, bool]:
     current.pop("cookies", None)
     current.pop("hifLeim", None)
     current.pop("hifDliq", None)
+    current.pop("deviceId", None)
 
     if changed:
         save_config(path, current)
@@ -777,13 +997,17 @@ def upsert_config_account(path: Path, account: dict) -> tuple[int, bool]:
 
 
 def print_accounts(accounts: list[dict]) -> None:
-    print(f"{'#':<3} {'active':<7} {'cookies':<8} {'hif':<5} {'token':<20} profile")
+    print(
+        f"{'#':<3} {'active':<7} {'cookies':<8} {'hif':<5} "
+        f"{'device':<7} {'token':<20} profile"
+    )
     for index, account in enumerate(accounts, 1):
         print(
             f"{index:<3} "
             f"{'yes' if account['active'] else 'no':<7} "
             f"{len(account['cookieNames']):<8} "
             f"{'yes' if account['hifLeim'] or account['hifDliq'] else 'no':<5} "
+            f"{'yes' if account.get('deviceId') else 'no':<7} "
             f"{mask_token(account['token']):<20} "
             f"{account['profile']}"
         )
@@ -810,7 +1034,10 @@ def print_no_token_error(profiles: list[Profile]) -> None:
 
 
 def print_table(profiles: list[Profile]) -> None:
-    print(f"{'active':<7} {'token':<6} {'hif':<5} {'modified':<17} profile/container")
+    print(
+        f"{'active':<7} {'token':<6} {'hif':<5} {'device':<7} "
+        f"{'modified':<17} profile/container"
+    )
     for profile in sorted(
         profiles, key=lambda item: (item.active, item.mtime), reverse=True
     ):
@@ -823,6 +1050,7 @@ def print_table(profiles: list[Profile]) -> None:
             f"{'yes' if profile.active else 'no':<7} "
             f"{'yes' if profile.token else 'no':<6} "
             f"{'yes' if profile.hif_leim or profile.hif_dliq else 'no':<5} "
+            f"{'yes' if profile.device_id else 'no':<7} "
             f"{modified:<17} {profile.label}"
         )
         if profile.error:
@@ -892,6 +1120,12 @@ def watch_accounts(args, config_path: Path) -> int:
                         include_cookies=include_cookies,
                         include_hif=include_hif,
                     )
+                    if getattr(args, "validate_tokens", True):
+                        result = validate_account(details, args.validation_timeout)
+                        print_validation(details, result, args.quiet)
+                        if not result.alive:
+                            seen.add(profile.token)
+                            continue
                     position, changed = upsert_config_account(
                         config_path, config_account(details)
                     )
@@ -926,7 +1160,9 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "The browser may stay open. Databases are read from a private copy.\n"
             "Use --write for one session, --write-accounts to save every profile and\n"
-            "container with a token, or --watch to capture accounts as you switch."
+            "container with a token, or --watch to capture accounts as you switch.\n"
+            "Writes validate each token first and keep only live, unchallenged ones;\n"
+            "use --no-validate to skip the check."
         ),
     )
     parser.add_argument(
@@ -1001,6 +1237,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not include the hif_leim/hif_dliq values in output or config",
     )
     parser.add_argument(
+        "--no-validate",
+        action="store_true",
+        help="skip the live token check (writes can then contain dead tokens)",
+    )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="check tokens before writing (the default for --write/--write-accounts/--watch)",
+    )
+    parser.add_argument(
+        "--alive-only",
+        action="store_true",
+        help="only print tokens that passed validation (implies --validate)",
+    )
+    parser.add_argument(
+        "--validation-timeout",
+        type=float,
+        default=15.0,
+        metavar="SECONDS",
+        help="timeout for the read-only token validation request (default: 15)",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="suppress informational output",
@@ -1028,6 +1286,21 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.interval < 0.5:
         parser.error("--interval must be at least 0.5 seconds")
+    if args.validation_timeout <= 0:
+        parser.error("--validation-timeout must be greater than zero")
+    if args.alive_only and args.no_validate:
+        parser.error("--alive-only cannot be combined with --no-validate")
+
+    # Validation is on by default whenever the result can reach the config.
+    # --validate forces it for --json/--token-only; --no-validate is the
+    # explicit offline escape hatch.
+    args.validate_tokens = not args.no_validate and bool(
+        args.validate
+        or args.alive_only
+        or args.write
+        or args.write_accounts
+        or args.watch
+    )
 
     config_path = (
         Path(args.config).expanduser() if args.config else default_config_path()
@@ -1084,42 +1357,128 @@ def main(argv: Optional[list[str]] = None) -> int:
                 for profile in selected
             ]
 
+            unknown: list[dict] = []
+            if args.validate_tokens:
+                checked: list[dict] = []
+                for item in details:
+                    result = validate_account(item, args.validation_timeout)
+                    print_validation(item, result, args.quiet)
+                    checked.append(attach_validation(item, result))
+                    if result.status == "unknown":
+                        unknown.append(item)
+                details = checked
+                if args.alive_only:
+                    details = [item for item in details if item.get("alive")]
+
+            has_alive = any(item.get("alive") for item in details)
+            write_failed = False
             if args.write:
-                write_config(
-                    config_path,
-                    {"accounts": [config_account(item) for item in details]},
-                    remove=("token", "cookies", "hifLeim", "hifDliq"),
-                )
+                if args.validate_tokens and unknown:
+                    print(
+                        "Refusing to rewrite the config because validation was "
+                        "unavailable for one or more tokens; no accounts were "
+                        "removed. Re-run when the network is healthy.",
+                        file=sys.stderr,
+                    )
+                    write_failed = True
+                else:
+                    live = [
+                        item
+                        for item in details
+                        if not args.validate_tokens or item.get("alive")
+                    ]
+                    if args.validate_tokens and not live:
+                        print(
+                            "warning: no alive tokens found; writing an empty "
+                            "accounts array. Log in again and re-run.",
+                            file=sys.stderr,
+                        )
+                    write_config(
+                        config_path,
+                        {"accounts": [config_account(item) for item in live]},
+                        remove=("token", "cookies", "hifLeim", "hifDliq"),
+                    )
+                    if not args.quiet:
+                        print(
+                            f"\nConfig:  {config_path} "
+                            f"(mode 600, {len(live)} account(s))"
+                        )
 
             if args.token_only:
                 for account in details:
-                    print(account["token"])
-                return 0
+                    if not args.validate_tokens or account.get("alive"):
+                        print(account["token"])
+                return 1 if write_failed or (args.validate_tokens and not has_alive) else 0
 
             if args.json:
                 print(json.dumps({"accounts": details}, indent=2))
-                return 0
+                return 1 if write_failed or (args.validate_tokens and not has_alive) else 0
 
             if not args.quiet:
                 print_accounts(details)
-                if args.write:
-                    print(
-                        f"\nConfig:  {config_path} "
-                        f"(mode 600, {len(details)} account(s))"
-                    )
-                else:
+                if not args.write:
                     print(
                         "\nConfig:  not written "
                         "(add --write or use --write-accounts)"
                     )
 
-            return 0
+            return 1 if write_failed or (args.validate_tokens and not has_alive) else 0
 
+        selected = select_accounts(analyzed)
         best = choose_profile(analyzed)
 
-        if best is None:
+        if best is None or not selected:
             print_no_token_error(analyzed)
             return 1
+
+        payload: dict
+        if args.validate_tokens:
+            checked: list[dict] = []
+            chosen: Optional[tuple[Profile, dict]] = None
+            unknown = False
+            for profile in selected:
+                item = account_details(
+                    profile,
+                    tempdir,
+                    include_cookies=not args.no_cookies,
+                    include_hif=not args.no_hif,
+                )
+                result = validate_account(item, args.validation_timeout)
+                print_validation(item, result, args.quiet)
+                enriched = attach_validation(item, result)
+                checked.append(enriched)
+                if result.status == "unknown":
+                    unknown = True
+                if result.alive and chosen is None:
+                    chosen = (profile, enriched)
+
+            if chosen is None:
+                if args.json:
+                    print(json.dumps({"accounts": checked}, indent=2))
+                print(
+                    "No alive DeepSeek token found; the config was not changed. "
+                    + (
+                        "Validation was unavailable (network/TLS/5xx); try again."
+                        if unknown
+                        else "Open https://chat.deepseek.com in the browser, complete any "
+                        "verification, then re-run this command."
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+
+            best, payload = chosen
+            if not args.quiet:
+                for profile in selected:
+                    if profile is not best:
+                        print(f"         also (not selected): {profile.label}", file=sys.stderr)
+        else:
+            payload = account_details(
+                best,
+                tempdir,
+                include_cookies=not args.no_cookies,
+                include_hif=not args.no_hif,
+            )
 
         if not best.active and not args.quiet:
             print(
@@ -1128,7 +1487,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
 
         token_profiles = [profile for profile in analyzed if profile.token]
-        if len(token_profiles) > 1 and not args.quiet:
+        if len(token_profiles) > 1 and not args.quiet and not args.validate_tokens:
             print(
                 f"warning: {len(token_profiles)} sessions contain a DeepSeek token; "
                 f"using {best.label}",
@@ -1138,28 +1497,25 @@ def main(argv: Optional[list[str]] = None) -> int:
                 if profile is not best:
                     print(f"         also: {profile.label}", file=sys.stderr)
 
-        payload = account_details(
-            best,
-            tempdir,
-            include_cookies=not args.no_cookies,
-            include_hif=not args.no_hif,
-        )
         cookie_names = payload["cookieNames"]
         cookie_header = payload["cookies"]
         hif_leim = payload["hifLeim"]
         hif_dliq = payload["hifDliq"]
+        device_id = payload.get("deviceId") or ""
 
         if args.write:
             existing = load_config(config_path)
             existing_accounts = existing.get("accounts")
             if isinstance(existing_accounts, list) and existing_accounts:
-                account = {"token": best.token}
+                account = {"token": payload["token"]}
                 if cookie_header:
                     account["cookies"] = cookie_header
                 if hif_leim:
                     account["hifLeim"] = hif_leim
                 if hif_dliq:
                     account["hifDliq"] = hif_dliq
+                if device_id:
+                    account["deviceId"] = device_id
                 position, _ = upsert_config_account(config_path, account)
                 if not args.quiet:
                     print(
@@ -1168,17 +1524,19 @@ def main(argv: Optional[list[str]] = None) -> int:
                         file=sys.stderr,
                     )
             else:
-                patch = {"token": best.token}
+                patch = {"token": payload["token"]}
                 if cookie_header:
                     patch["cookies"] = cookie_header
                 if hif_leim:
                     patch["hifLeim"] = hif_leim
                 if hif_dliq:
                     patch["hifDliq"] = hif_dliq
+                if device_id:
+                    patch["deviceId"] = device_id
                 write_config(config_path, patch)
 
         if args.token_only:
-            print(best.token)
+            print(payload["token"])
             return 0
 
         if args.json:
@@ -1187,9 +1545,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         if not args.quiet:
             print(f"Profile: {best.label}")
+            if args.validate_tokens:
+                print(f"Status:  {payload.get('validation', 'unknown')}")
             print(
-                f"Token:   {mask_token(best.token)} "
-                f"({len(best.token)} chars)"
+                f"Token:   {mask_token(payload['token'])} "
+                f"({len(payload['token'])} chars)"
             )
             if args.no_cookies:
                 print("Cookies: (skipped)")

@@ -38,6 +38,7 @@ function browserHeaders(
     cookie = '',
     hifLeim = '',
     hifDliq = '',
+    deviceId = '',
     extraHeaders = {},
   } = {},
 ) {
@@ -60,7 +61,42 @@ function browserHeaders(
   headers['sec-fetch-dest'] = 'empty';
   headers['sec-fetch-mode'] = 'cors';
   headers['sec-fetch-site'] = site;
+  if (deviceId) {
+    // The web client's request interceptor appends these last. The browser
+    // stores the UUID in localStorage per container; using the same value is
+    // part of the account's device identity.
+    headers['x-device-id'] = deviceId;
+    headers['x-device-model'] = '';
+  }
   return headers;
+}
+
+function parseRetryAfter(value) {
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+  const date = Date.parse(value);
+  if (Number.isFinite(date)) return Math.max(0, date - Date.now());
+  return null;
+}
+
+function isChallengeResponse(response, json, text = '') {
+  const waf = String(response?.headers?.get('x-amzn-waf-action') || '').toLowerCase();
+  const cf = String(response?.headers?.get('cf-mitigated') || '').toLowerCase();
+  if (
+    (response?.status === 405 && waf === 'captcha') ||
+    (response?.status === 202 && waf === 'challenge') ||
+    ((response?.status === 403 || response?.status === 429) && cf === 'challenge')
+  ) {
+    return true;
+  }
+  return Boolean(challengeMessage(json, text));
+}
+
+function throwIfChallengeResponse(response, json, text = '') {
+  if (isChallengeResponse(response, json, text)) {
+    throw new ChallengeError('DeepSeek requires manual verification (captcha/challenge)');
+  }
 }
 
 function challengeMessage(json, text = '') {
@@ -78,11 +114,6 @@ function challengeMessage(json, text = '') {
   return null;
 }
 
-function throwIfChallenge(json, text = '') {
-  const message = challengeMessage(json, text);
-  if (message) throw new ChallengeError(message);
-}
-
 export class DeepSeekClient {
   constructor({ tokenStore, solver, config, hif, fetchImpl = fetch }) {
     this.tokenStore = tokenStore;
@@ -91,12 +122,16 @@ export class DeepSeekClient {
     this.fetch = withZstd(fetchImpl);
     // `hif: null` disables the runtime fetch (tests, or when the user wants
     // the old static x-hif-leim behavior).
+    // `hifRefreshEnabled: false` disables the runtime hif-leim/hif-dliq polls
+    // entirely, so completions carry only the static configured values.
     this.hif =
       hif === undefined
-        ? new HifStore({
-            fetchImpl: this.fetch,
-            refreshDliq: this.cfg.hifDliqRefresh === true,
-          })
+        ? this.cfg.hifRefreshEnabled === false
+          ? null
+          : new HifStore({
+              fetchImpl: this.fetch,
+              refreshDliq: this.cfg.hifDliqRefresh === true,
+            })
         : hif;
   }
 
@@ -143,6 +178,7 @@ export class DeepSeekClient {
       cookie: active?.cookies || '',
       hifLeim,
       hifDliq,
+      deviceId: active?.deviceId || '',
       extraHeaders: extra,
     });
   }
@@ -180,20 +216,42 @@ export class DeepSeekClient {
           // ignore
         }
 
-        throwIfChallenge(json, text);
+        throwIfChallengeResponse(response, json, text);
 
         if (response.status === 401) throw new AuthError();
         if (json && [40002, 40003].includes(json.code)) throw new AuthError(json.msg);
+
+        if (response.status === 429 || json?.code === 50006) {
+          throw new UpstreamError(json?.msg || 'DeepSeek rate limit reached', {
+            status: 429,
+            code: json?.code ?? 429,
+            retryable: true,
+            retryAfterMs: parseRetryAfter(response.headers.get('retry-after')),
+          });
+        }
 
         const session = json?.data?.biz_data?.chat_session;
         if (session?.id) return session.id;
 
         lastError = new UpstreamError(
           json?.msg || `Failed to create chat session (HTTP ${response.status})`,
-          { status: response.status >= 400 ? response.status : 502, code: json?.code },
+          {
+            status: response.status >= 400 ? response.status : 502,
+            code: json?.code,
+            retryAfterMs:
+              response.status === 429
+                ? parseRetryAfter(response.headers.get('retry-after'))
+                : null,
+          },
         );
       } catch (error) {
-        if (error instanceof AuthError) throw error;
+        if (
+          error instanceof AuthError ||
+          error instanceof ChallengeError ||
+          error instanceof UpstreamError
+        ) {
+          throw error;
+        }
         if (signal?.aborted) throw new UpstreamError('Request aborted', { status: 499 });
         lastError = error;
       }
@@ -219,7 +277,7 @@ export class DeepSeekClient {
       // ignore
     }
 
-    throwIfChallenge(json, text);
+    throwIfChallengeResponse(response, json, text);
 
     if (response.status === 401 || (json && [40002, 40003].includes(json.code))) {
       throw new AuthError(json?.msg);
@@ -229,7 +287,14 @@ export class DeepSeekClient {
     if (!challenge) {
       throw new UpstreamError(
         json?.msg || `Failed to create PoW challenge (HTTP ${response.status})`,
-        { status: response.status >= 400 ? response.status : 502, code: json?.code },
+        {
+          status: response.status >= 400 ? response.status : 502,
+          code: json?.code,
+          retryAfterMs:
+            response.status === 429
+              ? parseRetryAfter(response.headers.get('retry-after'))
+              : null,
+        },
       );
     }
 
@@ -253,7 +318,10 @@ export class DeepSeekClient {
       if (signal?.aborted) throw new UpstreamError('Request aborted', { status: 499 });
 
       try {
-        const powHeader = await this._createPowHeader(account, UPLOAD_PATH);
+        const powHeader =
+          this.cfg.powChallengeEnabled === false
+            ? ''
+            : await this._createPowHeader(account, UPLOAD_PATH);
         const form = new FormData();
         form.append('file', file);
 
@@ -261,8 +329,8 @@ export class DeepSeekClient {
           'x-thinking-enabled': thinking ? '1' : '0',
           'x-model-type': modelType,
           'x-file-size': String(file.size ?? 0),
-          'x-ds-pow-response': powHeader,
         };
+        if (powHeader) extraHeaders['x-ds-pow-response'] = powHeader;
         const headers = await this._headers(account, extraHeaders);
         // Let fetch set the multipart boundary; the JSON content-type from
         // _headers would break the upload.
@@ -285,7 +353,7 @@ export class DeepSeekClient {
           // ignore
         }
 
-        throwIfChallenge(json, text);
+        throwIfChallengeResponse(response, json, text);
 
         const bizCode = json?.data?.biz_code;
         if (json && isPowError(bizCode) && attempt < 2) {
@@ -299,6 +367,15 @@ export class DeepSeekClient {
 
         if (response.status === 401 || (json && [40002, 40003].includes(json.code))) {
           throw new AuthError(json?.msg || 'DeepSeek token is invalid or expired');
+        }
+
+        if (response.status === 429 || bizCode === 50006) {
+          throw new UpstreamError(json?.data?.biz_msg || json?.msg || 'DeepSeek rate limit reached', {
+            status: 429,
+            code: bizCode ?? json?.code ?? 429,
+            retryable: true,
+            retryAfterMs: parseRetryAfter(response.headers.get('retry-after')),
+          });
         }
 
         if (bizCode !== undefined && bizCode !== 0) {
@@ -365,11 +442,16 @@ export class DeepSeekClient {
 
       try {
         // PoW answers are single-use, so a fresh challenge is required for
-        // every upstream completion request.
-        const powHeader = await this._createPowHeader(account);
+        // every upstream completion request. powChallengeEnabled=false skips
+        // the extra challenge POST and the x-ds-pow-response header.
+        const powHeader =
+          this.cfg.powChallengeEnabled === false
+            ? ''
+            : await this._createPowHeader(account);
+        const extraHeaders = powHeader ? { 'x-ds-pow-response': powHeader } : {};
         const response = await this._fetch(COMPLETION_PATH, {
           body,
-          extraHeaders: { 'x-ds-pow-response': powHeader },
+          extraHeaders,
           signal,
           account,
           hif: true,
@@ -377,6 +459,7 @@ export class DeepSeekClient {
 
         const contentType = response.headers.get('content-type') || '';
 
+        throwIfChallengeResponse(response, null, '');
         if (contentType.includes('text/event-stream')) return response;
 
         const text = await response.text();
@@ -387,7 +470,7 @@ export class DeepSeekClient {
           // ignore
         }
 
-        throwIfChallenge(json, text);
+        throwIfChallengeResponse(response, json, text);
 
         if (json && isPowError(json.code) && attempt < 2) {
           lastError = new UpstreamError(json.msg || 'Invalid PoW response', {
@@ -407,6 +490,7 @@ export class DeepSeekClient {
             status: 429,
             code: json?.code ?? 429,
             retryable: true,
+            retryAfterMs: parseRetryAfter(response.headers.get('retry-after')),
           });
         }
 
